@@ -75,7 +75,7 @@ cli_opts = [
                     'will exit with a non-zero exit code.'),
 
     cfg.IntOpt('lookup_interval',
-               default=int(APARAMS.get('ipa-lookup-timeout', 1)),
+               default=int(APARAMS.get('ipa-lookup-interval', 1)),
                deprecated_name='lookup-interval',
                help='The initial interval for retries on the initial '
                     'lookup call to Ironic. The interval will be '
