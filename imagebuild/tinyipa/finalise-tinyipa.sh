@@ -68,7 +68,7 @@ setup_tce "$DST_DIR"
 
 # Modify ldconfig for x86-64
 $CHROOT_CMD cp /sbin/ldconfig /sbin/ldconfigold
-printf '/sbin/ldconfigold $@ | sed "s/unknown/libc6,x86-64/"' | $CHROOT_CMD tee -a /sbin/ldconfignew
+printf '/sbin/ldconfigold $@ | sed "s/libc6/libc6,x86-64/"' | $CHROOT_CMD tee -a /sbin/ldconfignew
 $CHROOT_CMD cp /sbin/ldconfignew /sbin/ldconfig
 $CHROOT_CMD chmod u+x /sbin/ldconfig
 

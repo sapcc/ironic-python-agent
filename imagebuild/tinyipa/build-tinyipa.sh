@@ -37,10 +37,13 @@ fi
 
 # Find a working TC mirror if none is explicitly provided
 choose_tc_mirror
+SOURCE=${SOURCE:-$TINYCORE_MIRROR_URL/8.x/x86_64/release/distribution_files}
+TINYCORE_ROOTFS=${TINYCORE_ROOTFS:-$SOURCE/corepure64.gz}
+TINYCORE_KERNEL=${TINYCORE_KERNEL:-$SOURCE/vmlinuz64}
 
 cd $WORKDIR/build_files
-wget -N $TINYCORE_MIRROR_URL/7.x/x86_64/release/distribution_files/corepure64.gz
-wget -N $TINYCORE_MIRROR_URL/7.x/x86_64/release/distribution_files/vmlinuz64
+curl -o corepure64.gz ${TINYCORE_ROOTFS}
+curl -o vmlinuz64 ${TINYCORE_KERNEL}
 cd $WORKDIR
 
 ########################################################
@@ -51,7 +54,7 @@ cd $WORKDIR
 mkdir "$BUILDDIR"
 
 # Extract rootfs from .gz file
-( cd "$BUILDDIR" && zcat $WORKDIR/build_files/corepure64.gz | sudo cpio -i -H newc -d )
+( cd "$BUILDDIR" && zcat "$WORKDIR/build_files/corepure64.gz" | sudo cpio -i -H newc -d )
 
 # Configure mirror
 sudo sh -c "echo $TINYCORE_MIRROR_URL > $BUILDDIR/opt/tcemirror"
@@ -76,7 +79,7 @@ mkdir -p "$BUILDDIR/tmp/localpip"
 # Download IPA and requirements
 cd ../..
 rm -rf *.egg-info
-python setup.py sdist --dist-dir "$BUILDDIR/tmp/localpip" --quiet
+python setup.py sdist --dist-dir "$BUILDDIR/tmp/localpip"
 cp requirements.txt $BUILDDIR/tmp/ipa-requirements.txt
 
 imagebuild/common/generate_upper_constraints.sh upper-constraints.txt
