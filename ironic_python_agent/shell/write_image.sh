@@ -42,7 +42,7 @@ log "Imaging $IMAGEFILE to $DEVICE"
 
 # limit the memory usage for qemu-img to 1 GiB
 ulimit -v 1048576
-qemu-img convert -t directsync -O host_device $IMAGEFILE $DEVICE
+qemu-img convert -O host_device $IMAGEFILE $DEVICE
 sync
 
 log "${DEVICE} imaged successfully!"
