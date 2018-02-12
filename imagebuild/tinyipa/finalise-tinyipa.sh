@@ -75,7 +75,7 @@ sudo sh -c "echo $TINYCORE_MIRROR_URL > $FINALDIR/opt/tcemirror"
 $CHROOT_CMD cp /sbin/ldconfig /sbin/ldconfigold
 printf '/sbin/ldconfigold $@ | sed "s/libc6/libc6,x86-64/"' | $CHROOT_CMD tee -a /sbin/ldconfignew
 $CHROOT_CMD cp /sbin/ldconfignew /sbin/ldconfig
-$CHROOT_CMD chmod u+x /sbin/ldconfig
+$CHROOT_CMD chmod a+x /sbin/ldconfig
 
 # Copy python wheels from build to final dir
 cp -Rp "$BUILDDIR/tmp/wheels" "$FINALDIR/tmp/wheelhouse"
