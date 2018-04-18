@@ -7,8 +7,8 @@ iproute2.tcz
 parted.tcz
 popt.tcz
 python.tcz
-raid-dm-4.8.17-tinycore64.tcz
-scsi-4.8.17-tinycore64.tcz
+raid-dm-4.14.10-tinycore64.tcz
+scsi-4.14.10-tinycore64.tcz
 udev-lib.tcz
 util-linux.tcz
 glib2.tcz
