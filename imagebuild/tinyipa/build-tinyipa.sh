@@ -37,7 +37,7 @@ fi
 
 # Find a working TC mirror if none is explicitly provided
 choose_tc_mirror
-SOURCE=${SOURCE:-$TINYCORE_MIRROR_URL/8.x/x86_64/release/distribution_files}
+SOURCE=${SOURCE:-$TINYCORE_MIRROR_URL/9.x/x86_64/release/distribution_files}
 TINYCORE_ROOTFS=${TINYCORE_ROOTFS:-$SOURCE/corepure64.gz}
 TINYCORE_KERNEL=${TINYCORE_KERNEL:-$SOURCE/vmlinuz64}
 

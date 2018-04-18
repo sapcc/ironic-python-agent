@@ -1,7 +1,7 @@
 #!/bin/sh
 S="Linux"
 N="box"
-R="4.8.17-tinycore64"
+R="4.14.10-tinycore64"
 P="unknown"
 V="#777 SMP (2016-02-29)"
 M="x86_64"
