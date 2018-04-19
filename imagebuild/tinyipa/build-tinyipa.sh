@@ -118,8 +118,8 @@ while read line; do
 done < $WORKDIR/build_files/buildreqs.lst
 
 # Build python wheels
-$CHROOT_CMD mknod -m 444 /dev/random c 1 8 || true
-$CHROOT_CMD mknod -m 444 /dev/urandom c 1 9 || true
+$CHROOT_CMD mknod -m 444 /dev/random c 1 8 || $CHROOT_CMD true
+$CHROOT_CMD mknod -m 444 /dev/urandom c 1 9 || $CHROOT_CMD true
 $CHROOT_CMD python /tmp/get-pip.py
 $CHROOT_CMD pip install pbr
 $CHROOT_CMD pip wheel -c /tmp/upper-constraints.txt --wheel-dir /tmp/wheels setuptools
