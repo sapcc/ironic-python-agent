@@ -62,8 +62,8 @@ sudo sh -c "echo $TINYCORE_MIRROR_URL > $BUILDDIR/opt/tcemirror"
 ( cd "$BUILDDIR/tmp" && wget https://bootstrap.pypa.io/get-pip.py )
 
 # Download TGT, Qemu-utils and IPMItool source
-clone_and_checkout "https://github.com/fujita/tgt.git" "${BUILDDIR}/tmp/tgt" "v1.0.62"
-clone_and_checkout "https://github.com/qemu/qemu.git" "${BUILDDIR}/tmp/qemu" "v2.5.0"
+clone_and_checkout "https://github.com/fujita/tgt.git" "${BUILDDIR}/tmp/tgt" "v1.0.73"
+clone_and_checkout "https://github.com/qemu/qemu.git" "${BUILDDIR}/tmp/qemu" "v2.11.1"
 if $TINYIPA_REQUIRE_IPMITOOL; then
     curl -L https://sourceforge.net/projects/ipmitool/files/ipmitool/1.8.18/ipmitool-1.8.18.tar.gz/download | tar -xz -C "${BUILDDIR}/tmp" -f -
 fi
