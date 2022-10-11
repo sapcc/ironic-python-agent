@@ -12,9 +12,9 @@
 # limitations under the License.
 
 import subprocess
+from unittest import mock
 
 import ironic_lib
-import mock
 from oslo_concurrency import processutils
 
 from ironic_python_agent.tests.unit import base as ironic_agent_base
@@ -30,10 +30,7 @@ class BlockExecuteTestCase(ironic_agent_base.IronicAgentTest):
                              subprocess.check_output, utils.execute)
 
         for function_name in execute_functions:
-            exc = self.assertRaises(
-                Exception,
-                function_name,
-                ["echo", "%s" % function_name])  # noqa
+            exc = self.assertRaises(Exception, function_name, ["echo", "%s" % function_name])  # noqa
             # Have to use 'noqa' as we are raising plain Exception and we will
             # get H202 error in 'pep8' check.
 
@@ -52,24 +49,6 @@ class BlockExecuteTestCase(ironic_agent_base.IronicAgentTest):
         utils.execute("ls")
         utils.execute("echo")
         self.assertEqual(2, mock_exec.call_count)
-
-    @mock.patch.object(ironic_lib.utils, "execute", autospec=True)
-    def test_exception_raised_for_execute_parent_mocked(self, mock_exec):
-        # Make sure that even if we mock the parent execute function, that we
-        # still get an exception for a child. So in this case utils.execute()
-        # calls ironic_lib.utils.execute(). Make sure an exception is raised
-        # even though we mocked ironic_lib.utils.execute()
-        exc = self.assertRaises(
-            Exception,
-            utils.execute,
-            "ls")  # noqa
-        # Have to use 'noqa' as we are raising plain Exception and we will get
-        # H202 error in 'pep8' check.
-
-        self.assertEqual(
-            "Don't call ironic_lib.utils.execute() / "
-            "processutils.execute() or similar functions in tests!",
-            "%s" % exc)
 
 
 class DontBlockExecuteTestCase(ironic_agent_base.IronicAgentTest):

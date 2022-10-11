@@ -4,13 +4,15 @@
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
 extensions = ['sphinx.ext.autodoc',
               'sphinx.ext.viewcode',
-              'sphinxcontrib.httpdomain',
-              'sphinxcontrib.pecanwsme.rest',
-              'wsmeext.sphinxext',
+              'sphinxcontrib.apidoc',
               'openstackdocstheme',
               ]
 
-wsme_protocols = ['restjson']
+openstackdocs_projects = [
+    'ironic',
+    'ironic-inspector',
+    'ironic-lib',
+]
 
 # autodoc generation is a bit aggressive and a nuisance when doing heavy
 # text edit cycles.
@@ -26,19 +28,7 @@ source_suffix = '.rst'
 master_doc = 'index'
 
 # General information about the project.
-project = u'Ironic Python Agent'
-copyright = u'OpenStack Foundation'
-
-# The version info for the project you're documenting, acts as replacement for
-# |version| and |release|, also used in various other places throughout the
-# built documents.
-#
-# The short X.Y version.
-from ironic_python_agent import version as ipa_version
-# The full version, including alpha/beta/rc tags.
-release = ipa_version.version_info.release_string()
-# The short X.Y version.
-version = ipa_version.version_info.version_string()
+copyright = 'OpenStack Foundation'
 
 # A list of ignored prefixes for module index sorting.
 modindex_common_prefix = ['ironic_python_agent']
@@ -51,12 +41,15 @@ add_function_parentheses = True
 add_module_names = True
 
 # The name of the Pygments (syntax highlighting) style to use.
-pygments_style = 'sphinx'
+pygments_style = 'native'
 
-# Ignore the following warning: WARNING: while setting up extension
-# wsmeext.sphinxext: directive 'autoattribute' is already registered,
-# it will be overridden.
-suppress_warnings = ['app.add_directive']
+# sphinxcontrib.apidoc options
+apidoc_module_dir = '../../ironic_python_agent'
+apidoc_output_dir = 'contributor/api'
+apidoc_excluded_paths = [
+    'tests',
+]
+apidoc_separate_modules = True
 
 
 # -- Options for HTML output --------------------------------------------------
@@ -66,16 +59,14 @@ suppress_warnings = ['app.add_directive']
 html_theme = 'openstackdocs'
 
 # openstackdocstheme options
-repository_name = 'openstack/ironic-python-agent'
-bug_project = 'ironic-python-agent'
-bug_tag = ''
-
-# Must set this variable to include year, month, day, hours, and minutes.
-html_last_updated_fmt = '%Y-%m-%d %H:%M'
+openstackdocs_repo_name = 'openstack/ironic-python-agent'
+openstackdocs_pdf_link = True
+openstackdocs_use_storyboard = True
 
 # Output file base name for HTML help builder.
-htmlhelp_basename = '%sdoc' % project
+htmlhelp_basename = 'Ironic Python Agentdoc'
 
+latex_use_xindy = False
 
 # Grouping the document tree into LaTeX files. List of tuples
 # (source start file, target name, title, author, documentclass
@@ -83,9 +74,9 @@ htmlhelp_basename = '%sdoc' % project
 latex_documents = [
     (
         'index',
-        '%s.tex' % project,
-        u'%s Documentation' % project,
-        u'OpenStack Foundation',
+        'doc-ironic-python-agent.tex',
+        'Ironic Python Agent Documentation',
+        'OpenStack Foundation',
         'manual'
     ),
 ]

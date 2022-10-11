@@ -91,6 +91,15 @@ class RequestedObjectNotFoundError(NotFound):
         super(RequestedObjectNotFoundError, self).__init__(details)
 
 
+class AgentIsBusy(CommandExecutionError):
+
+    message = 'Agent is busy'
+    status_code = 409
+
+    def __init__(self, command_name):
+        super().__init__('executing command %s' % command_name)
+
+
 class IronicAPIError(RESTError):
     """Error raised when a call to the agent API fails."""
 
@@ -142,7 +151,7 @@ class ImageDownloadError(RESTError):
     message = 'Error downloading image'
 
     def __init__(self, image_id, msg):
-        details = 'Download of image id {} failed: {}'.format(image_id, msg)
+        details = 'Download of image {} failed: {}'.format(image_id, msg)
         self.secondary_message = msg
         super(ImageDownloadError, self).__init__(details)
 
@@ -204,6 +213,15 @@ class BlockDeviceError(RESTError):
         super(BlockDeviceError, self).__init__(details)
 
 
+class SoftwareRAIDError(RESTError):
+    """Error raised when a Software RAID causes an error."""
+
+    message = 'Software RAID caused unknown error'
+
+    def __init__(self, details):
+        super(SoftwareRAIDError, self).__init__(details)
+
+
 class VirtualMediaBootError(RESTError):
     """Error raised when virtual media device cannot be found for config."""
 
@@ -254,24 +272,26 @@ class IncompatibleHardwareMethodError(RESTError):
         super(IncompatibleHardwareMethodError, self).__init__(details)
 
 
-class CleanVersionMismatch(RESTError):
+class VersionMismatch(RESTError):
     """Error raised when Ironic and the Agent have different versions.
 
-    If the agent version has changed since get_clean_steps was called by
-    the Ironic conductor, it indicates the agent has been updated (either
-    on purpose, or a new agent was deployed and the node was rebooted).
-    Since we cannot know if the upgraded IPA will work with cleaning as it
-    stands (steps could have different priorities, either in IPA or in
-    other Ironic interfaces), we should restart cleaning from the start.
+    If the agent version has changed since get_clean_steps or get_deploy_steps
+    was called by the Ironic conductor, it indicates the agent has been updated
+    (either on purpose, or a new agent was deployed and the node was rebooted).
+    Since we cannot know if the upgraded IPA will work with cleaning/deploy as
+    it stands (steps could have different priorities, either in IPA or in
+    other Ironic interfaces), we should restart the process from the start.
 
     """
-    message = 'Clean version mismatch, reload agent with correct version'
+    message = (
+        'Hardware managers version mismatch, reload agent with correct version'
+    )
 
     def __init__(self, agent_version, node_version):
         self.status_code = 409
-        details = ('Agent clean version: {}, node clean version: {}'
+        details = ('Current versions: {}, versions used by ironic: {}'
                    .format(agent_version, node_version))
-        super(CleanVersionMismatch, self).__init__(details)
+        super(VersionMismatch, self).__init__(details)
 
 
 class CleaningError(RESTError):
@@ -283,29 +303,19 @@ class CleaningError(RESTError):
         super(CleaningError, self).__init__(details)
 
 
-class ISCSIError(RESTError):
-    """Error raised when an image cannot be written to a device."""
+class DeploymentError(RESTError):
+    """Error raised when a deploy step fails."""
 
-    message = 'Error starting iSCSI target'
+    message = 'Deploy step failed'
 
-    def __init__(self, error_msg):
-        details = 'Error starting iSCSI target: {}'.format(error_msg)
-        super(ISCSIError, self).__init__(details)
+    def __init__(self, details=None):
+        super(DeploymentError, self).__init__(details)
 
 
 class IncompatibleNumaFormatError(RESTError):
     """Error raised when unexpected format data in NUMA node."""
 
     message = 'Error in NUMA node data format'
-
-
-class ISCSICommandError(ISCSIError):
-    """Error executing TGT command."""
-
-    def __init__(self, error_msg, exit_code, stdout, stderr):
-        details = ('{}. Failed with exit code {}. stdout: {}. stderr: {}')
-        details = details.format(error_msg, exit_code, stdout, stderr)
-        super(ISCSICommandError, self).__init__(details)
 
 
 class DeviceNotFound(NotFound):
@@ -322,3 +332,38 @@ class DeviceNotFound(NotFound):
 # RESTError.
 class InspectionError(Exception):
     """Failure during inspection."""
+
+
+class ClockSyncError(RESTError):
+    """Error raised when attempting to sync the system clock."""
+
+    message = 'Error syncing system clock'
+
+
+class HeartbeatConnectionError(IronicAPIError):
+    """Transitory connection failure occured attempting to contact the API."""
+
+    message = ("Error attempting to heartbeat - Possible transitory network "
+               "failure or blocking port may be present.")
+
+    def __init__(self, details):
+        super(HeartbeatConnectionError, self).__init__(details)
+
+
+class ProtectedDeviceError(CleaningError):
+    """Error raised when a cleaning is halted due to a protected device."""
+
+    message = 'Protected device located, cleaning aborted.'
+
+    def __init__(self, device, what):
+        details = ('Protected %(what)s located on device %(device)s. '
+                   'This volume or contents may be a shared block device. '
+                   'Please consult your storage administrator, and restart '
+                   'cleaning after either detaching the volumes, or '
+                   'instructing IPA to not protect contents. See Ironic '
+                   'Python Agent documentation for more information.' %
+                   {'what': what,
+                    'device': device})
+
+        self.message = details
+        super(CleaningError, self).__init__(details)

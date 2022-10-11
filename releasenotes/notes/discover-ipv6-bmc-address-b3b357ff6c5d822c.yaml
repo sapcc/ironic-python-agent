@@ -1,0 +1,5 @@
+---
+features:
+  - |
+    IPv6 BMC address is now discovered during inspection and sent as a new
+    ``bmc_v6address`` inventory field.

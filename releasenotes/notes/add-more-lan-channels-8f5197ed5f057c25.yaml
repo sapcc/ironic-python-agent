@@ -1,0 +1,6 @@
+---
+fixes:
+  - |
+    Supports channel numbers 1 to 11 when looking for a BMC address. This is
+    consistent with the IPMI specification v2.0. Previously, only channels
+    1 to 7 were considered.

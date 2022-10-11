@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from unittest import mock
 
 from ironic_python_agent import errors
 from ironic_python_agent.extensions import clean
@@ -34,8 +34,8 @@ class TestCleanExtension(base.IronicAgentTest):
         }
         self.version = {'generic': '1', 'specific': '1'}
 
-    @mock.patch('ironic_python_agent.extensions.clean.'
-                '_get_current_clean_version', autospec=True)
+    @mock.patch('ironic_python_agent.hardware.get_current_versions',
+                autospec=True)
     @mock.patch('ironic_python_agent.hardware.dispatch_to_all_managers',
                 autospec=True)
     def test_get_clean_steps(self, mock_dispatch, mock_version,
@@ -141,7 +141,7 @@ class TestCleanExtension(base.IronicAgentTest):
 
     @mock.patch('ironic_python_agent.hardware.dispatch_to_managers',
                 autospec=True)
-    @mock.patch('ironic_python_agent.extensions.clean._check_clean_version',
+    @mock.patch('ironic_python_agent.hardware.check_versions',
                 autospec=True)
     def test_execute_clean_step(self, mock_version, mock_dispatch,
                                 mock_cache_node):
@@ -167,7 +167,7 @@ class TestCleanExtension(base.IronicAgentTest):
 
     @mock.patch('ironic_python_agent.hardware.dispatch_to_managers',
                 autospec=True)
-    @mock.patch('ironic_python_agent.extensions.clean._check_clean_version',
+    @mock.patch('ironic_python_agent.hardware.check_versions',
                 autospec=True)
     def test_execute_clean_step_tuple_result(self, mock_version,
                                              mock_dispatch, mock_cache_node):
@@ -191,7 +191,35 @@ class TestCleanExtension(base.IronicAgentTest):
         self.assertEqual(expected_result, async_result.command_result)
         mock_cache_node.assert_called_once_with(self.node)
 
-    @mock.patch('ironic_python_agent.extensions.clean._check_clean_version',
+    @mock.patch('ironic_python_agent.hardware.dispatch_to_managers',
+                autospec=True)
+    @mock.patch('ironic_python_agent.hardware.check_versions',
+                autospec=True)
+    def test_execute_clean_step_with_args(self, mock_version, mock_dispatch,
+                                          mock_cache_node):
+        result = 'cleaned'
+        mock_dispatch.return_value = result
+
+        step = self.step['GenericHardwareManager'][0]
+        step['args'] = {'foo': 'bar'}
+        expected_result = {
+            'clean_step': step,
+            'clean_result': result
+        }
+        async_result = self.agent_extension.execute_clean_step(
+            step=self.step['GenericHardwareManager'][0],
+            node=self.node, ports=self.ports,
+            clean_version=self.version)
+        async_result.join()
+
+        mock_version.assert_called_once_with(self.version)
+        mock_dispatch.assert_called_once_with(
+            self.step['GenericHardwareManager'][0]['step'],
+            self.node, self.ports, foo='bar')
+        self.assertEqual(expected_result, async_result.command_result)
+        mock_cache_node.assert_called_once_with(self.node)
+
+    @mock.patch('ironic_python_agent.hardware.check_versions',
                 autospec=True)
     def test_execute_clean_step_no_step(self, mock_version, mock_cache_node):
         async_result = self.agent_extension.execute_clean_step(
@@ -205,11 +233,12 @@ class TestCleanExtension(base.IronicAgentTest):
 
     @mock.patch('ironic_python_agent.hardware.dispatch_to_managers',
                 autospec=True)
-    @mock.patch('ironic_python_agent.extensions.clean._check_clean_version',
+    @mock.patch('ironic_python_agent.hardware.check_versions',
                 autospec=True)
     def test_execute_clean_step_fail(self, mock_version, mock_dispatch,
                                      mock_cache_node):
-        mock_dispatch.side_effect = RuntimeError
+        err = errors.BlockDeviceError("I'm a teapot")
+        mock_dispatch.side_effect = err
 
         async_result = self.agent_extension.execute_clean_step(
             step=self.step['GenericHardwareManager'][0], node=self.node,
@@ -217,6 +246,7 @@ class TestCleanExtension(base.IronicAgentTest):
         async_result.join()
 
         self.assertEqual('FAILED', async_result.command_status)
+        self.assertEqual(err, async_result.command_error)
 
         mock_version.assert_called_once_with(self.version)
         mock_dispatch.assert_called_once_with(
@@ -226,12 +256,34 @@ class TestCleanExtension(base.IronicAgentTest):
 
     @mock.patch('ironic_python_agent.hardware.dispatch_to_managers',
                 autospec=True)
-    @mock.patch('ironic_python_agent.extensions.clean._check_clean_version',
+    @mock.patch('ironic_python_agent.hardware.check_versions',
+                autospec=True)
+    def test_execute_clean_step_exception(self, mock_version, mock_dispatch,
+                                          mock_cache_node):
+        mock_dispatch.side_effect = RuntimeError('boom')
+
+        async_result = self.agent_extension.execute_clean_step(
+            step=self.step['GenericHardwareManager'][0], node=self.node,
+            ports=self.ports, clean_version=self.version)
+        async_result.join()
+
+        self.assertEqual('FAILED', async_result.command_status)
+        self.assertIn('RuntimeError: boom', str(async_result.command_error))
+
+        mock_version.assert_called_once_with(self.version)
+        mock_dispatch.assert_called_once_with(
+            self.step['GenericHardwareManager'][0]['step'],
+            self.node, self.ports)
+        mock_cache_node.assert_called_once_with(self.node)
+
+    @mock.patch('ironic_python_agent.hardware.dispatch_to_managers',
+                autospec=True)
+    @mock.patch('ironic_python_agent.hardware.check_versions',
                 autospec=True)
     def test_execute_clean_step_version_mismatch(self, mock_version,
                                                  mock_dispatch,
                                                  mock_cache_node):
-        mock_version.side_effect = errors.CleanVersionMismatch(
+        mock_version.side_effect = errors.VersionMismatch(
             {'GenericHardwareManager': 1}, {'GenericHardwareManager': 2})
 
         async_result = self.agent_extension.execute_clean_step(
@@ -241,24 +293,3 @@ class TestCleanExtension(base.IronicAgentTest):
         self.assertEqual('CLEAN_VERSION_MISMATCH', async_result.command_status)
 
         mock_version.assert_called_once_with(self.version)
-
-
-@mock.patch('ironic_python_agent.hardware.dispatch_to_all_managers',
-            autospec=True)
-class TestCleanVersion(base.IronicAgentTest):
-    version = {'generic': '1', 'specific': '1'}
-
-    def test__get_current_clean_version(self, mock_dispatch):
-        mock_dispatch.return_value = {'SpecificHardwareManager':
-                                      {'name': 'specific', 'version': '1'},
-                                      'GenericHardwareManager':
-                                      {'name': 'generic', 'version': '1'}}
-        self.assertEqual(self.version, clean._get_current_clean_version())
-
-    def test__check_clean_version_fail(self, mock_dispatch):
-        mock_dispatch.return_value = {'SpecificHardwareManager':
-                                      {'name': 'specific', 'version': '1'}}
-
-        self.assertRaises(errors.CleanVersionMismatch,
-                          clean._check_clean_version,
-                          {'not_specific': '1'})

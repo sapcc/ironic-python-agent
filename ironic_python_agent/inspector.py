@@ -13,17 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import time
 
+from ironic_lib import mdns
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_serialization import jsonutils
 from oslo_utils import excutils
 import requests
 import stevedore
+import tenacity
 
+from ironic_python_agent import config
 from ironic_python_agent import encoding
 from ironic_python_agent import errors
 from ironic_python_agent import hardware
@@ -32,8 +35,6 @@ from ironic_python_agent import utils
 
 LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
-DEFAULT_COLLECTOR = 'default'
-DEFAULT_DHCP_WAIT_TIMEOUT = 60
 
 _DHCP_RETRY_INTERVAL = 2
 _COLLECTOR_NS = 'ironic_python_agent.inspector.collectors'
@@ -50,6 +51,11 @@ def extension_manager(names):
         on_missing_entrypoints_callback=_extension_manager_err_callback)
 
 
+def _get_collector_names():
+    return [x.strip() for x in CONF.inspection_collectors.split(',')
+            if x.strip()]
+
+
 def inspect():
     """Optionally run inspection on the current node.
 
@@ -63,8 +69,16 @@ def inspect():
     if not CONF.inspection_callback_url:
         LOG.info('Inspection is disabled, skipping')
         return
-    collector_names = [x.strip() for x in CONF.inspection_collectors.split(',')
-                       if x.strip()]
+
+    if CONF.inspection_callback_url == 'mdns':
+        LOG.debug('Fetching the inspection URL from mDNS')
+        url, params = mdns.get_endpoint('baremetal-introspection')
+        # We expect a proper catalog URL, which doesn't include any path.
+        CONF.set_override('inspection_callback_url',
+                          url.rstrip('/') + '/v1/continue')
+        config.override(params)
+
+    collector_names = _get_collector_names()
     LOG.info('inspection is enabled with collectors %s', collector_names)
 
     # NOTE(dtantsur): inspection process tries to delay raising any exceptions
@@ -95,11 +109,15 @@ def inspect():
     failures.raise_if_needed()
 
     if resp is None:
-        LOG.info('stopping inspection, as inspector returned an error')
-        return
+        raise errors.InspectionError('stopping inspection, as inspector '
+                                     'returned an error')
 
     LOG.info('inspection finished successfully')
     return resp.get('uuid')
+
+
+_RETRY_WAIT = 5
+_RETRY_ATTEMPTS = 5
 
 
 def call_inspector(data, failures):
@@ -112,12 +130,22 @@ def call_inspector(data, failures):
 
     encoder = encoding.RESTJSONEncoder()
     data = encoder.encode(data)
-
     verify, cert = utils.get_ssl_client_options(CONF)
-    resp = requests.post(CONF.inspection_callback_url, data=data,
-                         verify=verify, cert=cert)
+
+    @tenacity.retry(
+        retry=tenacity.retry_if_exception_type(
+            requests.exceptions.ConnectionError),
+        stop=tenacity.stop_after_attempt(_RETRY_ATTEMPTS),
+        wait=tenacity.wait_fixed(_RETRY_WAIT),
+        reraise=True)
+    def _post_to_inspector():
+        return requests.post(CONF.inspection_callback_url, data=data,
+                             verify=verify, cert=cert)
+
+    resp = _post_to_inspector()
     if resp.status_code >= 400:
-        LOG.error('inspector error %d: %s, proceeding with lookup',
+        LOG.error('inspector %s error %d: %s, proceeding with lookup',
+                  CONF.inspection_callback_url,
                   resp.status_code, resp.content.decode('utf-8'))
         return
 
@@ -190,7 +218,7 @@ def collect_default(data, failures):
     :param failures: AccumulatedFailures object
     """
     wait_for_dhcp()
-    inventory = hardware.dispatch_to_managers('list_hardware_info')
+    inventory = hardware.list_hardware_info()
 
     data['inventory'] = inventory
     # Replicate the same logic as in deploy. We need to make sure that when
@@ -209,6 +237,10 @@ def collect_default(data, failures):
     data['boot_interface'] = inventory['boot'].pxe_interface
     LOG.debug('boot devices was %s', data['boot_interface'])
     LOG.debug('BMC IP address: %s', inventory.get('bmc_address'))
+    data['configuration'] = {
+        'collectors': _get_collector_names(),
+        'managers': [mgr.get_version() for mgr in hardware.get_managers()],
+    }
 
 
 def collect_logs(data, failures):
@@ -258,10 +290,10 @@ def collect_extra_hardware(data, failures):
         return
 
     try:
-        data['data'] = jsonutils.loads(out)
-    except ValueError as exc:
+        data['data'] = json.loads(out)
+    except json.decoder.JSONDecodeError as ex:
         msg = 'JSON returned from hardware-detect cannot be decoded: %s'
-        failures.add(msg, exc)
+        failures.add(msg, ex)
 
 
 def collect_pci_devices_info(data, failures):
@@ -297,17 +329,38 @@ def collect_pci_devices_info(data, failures):
             with open(os.path.join(pci_devices_path, subdir,
                                    'device')) as vendor_device:
                 device = vendor_device.read().strip().split('x')[1]
+            with open(os.path.join(pci_devices_path, subdir,
+                                   'class')) as vendor_device:
+                pci_class = vendor_device.read().strip().split('x')[1]
         except IOError as exc:
-            LOG.warning('Failed to gather vendor id or product id '
+            LOG.warning('Failed to gather vendor id, product id or pci class '
                         'from PCI device %s: %s', subdir, exc)
             continue
         except IndexError as exc:
-            LOG.warning('Wrong format of vendor id or product id in PCI '
-                        'device %s: %s', subdir, exc)
+            LOG.warning('Wrong format of vendor id, product id or pci class '
+                        'in PCI device %s: %s', subdir, exc)
             continue
+
+        pci_revision = None
+        pci_revision_path = os.path.join(pci_devices_path, subdir,
+                                         'revision')
+        if os.path.isfile(pci_revision_path):
+            try:
+                with open(pci_revision_path) as revision_file:
+                    pci_revision = revision_file.read().strip().split('x')[1]
+            except IOError as exc:
+                LOG.warning('Failed to gather PCI revision from PCI '
+                            'device %s: %s', subdir, exc)
+            except IndexError as exc:
+                LOG.warning('Wrong format of PCI revision in PCI '
+                            'device %s: %s', subdir, exc)
+
         LOG.debug(
-            'Found a PCI device with vendor id %s and product id %s',
-            vendor, device)
+            'Found a PCI device with vendor id %s, product id %s, class %s '
+            'and revision %s', vendor, device, pci_class, pci_revision)
         pci_devices_info.append({'vendor_id': vendor,
-                                 'product_id': device})
+                                 'product_id': device,
+                                 'class': pci_class,
+                                 'revision': pci_revision,
+                                 'bus': subdir})
     data['pci_devices'] = pci_devices_info

@@ -1,53 +1,43 @@
 - project:
     templates:
-      - openstack-python-jobs
-      - openstack-python35-jobs
-      - openstack-python36-jobs
-      - publish-openstack-docs-pti
       - check-requirements
+      - openstack-cover-jobs
+      - openstack-python3-jobs
+      - openstack-python3-jobs-arm64
+      - publish-openstack-docs-pti
       - release-notes-jobs-python3
     check:
       jobs:
-        - ipa-tempest-dsvm-partition-bios-ipmi-direct-tinyipa-src
-        - ipa-tempest-dsvm-partition-bios-ipmi-iscsi-tinyipa-src
-        - ipa-tempest-dsvm-wholedisk-bios-ipmi-direct-tinyipa-src
-        - ipa-tempest-dsvm-wholedisk-bios-ipmi-iscsi-tinyipa-src
+        - openstack-tox-functional
+        - ipa-tox-examples
+        # NOTE(iurygregory) Only run this two jobs since we are testing
+        # wholedisk + partition on tempest
+        - ipa-tempest-bios-ipmi-direct-src
+        - ipa-tempest-uefi-redfish-vmedia-src
+        - metalsmith-integration-ipa-src-uefi
+        - metalsmith-integration-ipa-src-legacy
+        - ironic-standalone-ipa-src
+        # NOTE(dtantsur): non-voting because IPA source code is very unlikely
+        # to break them. They rather serve as a canary for broken POST jobs.
+        - ironic-python-agent-check-image-tinyipa:
+            voting: false
+        - ironic-python-agent-check-image-dib-centos9:
+            voting: false
         # Non-voting jobs
-        - ipa-tempest-dsvm-ironic-inspector-src:
+        - ipa-tempest-ironic-inspector-src:
             voting: false
-        # NOTE(TheJulia): CoreOS jobs have a high failure rate.
-        # In order to reduce the odds of things like nested virt
-        # being detected but not available, we should treat them
-        # as non-voting. This is in order to reduce the need to
-        # recheck. If we non-voting tem on the gate, they are
-        # pointless, and the odds seem to enable them to pass
-        # more often than not.
-        # https://storyboard.openstack.org/#!/story/2003985
-        - ipa-tempest-dsvm-partition-bios-ipmi-direct-coreos-src:
+        - ipa-tox-bandit:
             voting: false
-        - ipa-tempest-dsvm-partition-bios-ipmi-iscsi-coreos-src:
-            voting: false
-        - ipa-tempest-dsvm-wholedisk-bios-ipmi-direct-coreos-src:
-            voting: false
-        - ipa-tempest-dsvm-wholedisk-bios-ipmi-iscsi-coreos-src:
-            voting: false
-        - openstack-tox-functional:
-            voting: false
-        - openstack-tox-lower-constraints
     gate:
-      queue: ironic
       jobs:
-        - ipa-tempest-dsvm-partition-bios-ipmi-direct-tinyipa-src
-        - ipa-tempest-dsvm-partition-bios-ipmi-iscsi-tinyipa-src
-        - ipa-tempest-dsvm-wholedisk-bios-ipmi-direct-tinyipa-src
-        - ipa-tempest-dsvm-wholedisk-bios-ipmi-iscsi-tinyipa-src
-        - openstack-tox-lower-constraints
-    experimental:
-      jobs:
-        - ipa-tempest-dsvm-partition-bios-ipmi-iscsi-tinyipa256-src
-        - ipa-tempest-dsvm-partition-ipmi-iscsi-tinyipa-python3
+        - openstack-tox-functional
+        - ipa-tox-examples
+        - ipa-tempest-bios-ipmi-direct-src
+        - ipa-tempest-uefi-redfish-vmedia-src
+        - metalsmith-integration-ipa-src-uefi
+        - metalsmith-integration-ipa-src-legacy
+        - ironic-standalone-ipa-src
     post:
       jobs:
-        - ironic-python-agent-buildimage-coreos
-        - ironic-python-agent-buildimage-tinyipa
-
+        - ironic-python-agent-build-image-tinyipa
+        - ironic-python-agent-build-image-dib-centos9

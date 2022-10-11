@@ -19,10 +19,11 @@ import threading
 
 from oslo_log import log
 from oslo_utils import uuidutils
-import six
+from stevedore import extension
 
 from ironic_python_agent import encoding
 from ironic_python_agent import errors
+from ironic_python_agent import utils
 
 
 LOG = log.getLogger()
@@ -33,13 +34,15 @@ class AgentCommandStatus(object):
     RUNNING = u'RUNNING'
     SUCCEEDED = u'SUCCEEDED'
     FAILED = u'FAILED'
-    CLEAN_VERSION_MISMATCH = u'CLEAN_VERSION_MISMATCH'
+    # TODO(dtantsur): keeping the same text for backward compatibility, change
+    # to just VERSION_MISMATCH one release after ironic is updated.
+    VERSION_MISMATCH = u'CLEAN_VERSION_MISMATCH'
 
 
 class BaseCommandResult(encoding.SerializableComparable):
     """Base class for command result."""
 
-    serializable_fields = ('id', 'command_name', 'command_params',
+    serializable_fields = ('id', 'command_name',
                            'command_status', 'command_error', 'command_result')
 
     def __init__(self, command_name, command_params):
@@ -60,9 +63,10 @@ class BaseCommandResult(encoding.SerializableComparable):
         return ("Command name: %(name)s, "
                 "params: %(params)s, status: %(status)s, result: "
                 "%(result)s." %
-                {"name": self.command_name, "params": self.command_params,
+                {"name": self.command_name,
+                 "params": utils.remove_large_keys(self.command_params),
                  "status": self.command_status,
-                 "result": self.command_result})
+                 "result": utils.remove_large_keys(self.command_result)})
 
     def is_done(self):
         """Checks to see if command is still RUNNING.
@@ -74,6 +78,17 @@ class BaseCommandResult(encoding.SerializableComparable):
     def join(self):
         """:returns: result of completed command."""
         return self
+
+    def wait(self):
+        """Join the result and extract its value.
+
+        Raises if the command failed.
+        """
+        self.join()
+        if self.command_error is not None:
+            raise self.command_error
+        else:
+            return self.command_result
 
 
 class SyncCommandResult(BaseCommandResult):
@@ -90,8 +105,7 @@ class SyncCommandResult(BaseCommandResult):
 
         super(SyncCommandResult, self).__init__(command_name,
                                                 command_params)
-
-        if isinstance(result_or_error, (bytes, six.text_type)):
+        if isinstance(result_or_error, (bytes, str)):
             result_key = 'result' if success else 'error'
             result_or_error = {result_key: result_or_error}
 
@@ -159,17 +173,18 @@ class AsyncCommandResult(BaseCommandResult):
         try:
             result = self.execute_method(**self.command_params)
 
-            if isinstance(result, (bytes, six.text_type)):
+            if isinstance(result, (bytes, str)):
                 result = {'result': '{}: {}'.format(self.command_name, result)}
-            LOG.info('Command: %(name)s, result: %(result)s',
-                     {'name': self.command_name, 'result': result})
+            LOG.info('Asynchronous command %(name)s completed: %(result)s',
+                     {'name': self.command_name,
+                      'result': utils.remove_large_keys(result)})
             with self.command_state_lock:
                 self.command_result = result
                 self.command_status = AgentCommandStatus.SUCCEEDED
-        except errors.CleanVersionMismatch as e:
+        except errors.VersionMismatch as e:
             with self.command_state_lock:
                 self.command_error = e
-                self.command_status = AgentCommandStatus.CLEAN_VERSION_MISMATCH
+                self.command_status = AgentCommandStatus.VERSION_MISMATCH
                 self.command_result = None
             LOG.error('Clean version mismatch for command %s',
                       self.command_name)
@@ -236,7 +251,8 @@ class ExecuteCommandMixin(object):
         """Execute an agent command."""
         with self.command_lock:
             LOG.debug('Executing command: %(name)s with args: %(args)s',
-                      {'name': command_name, 'args': kwargs})
+                      {'name': command_name,
+                       'args': utils.remove_large_keys(kwargs)})
             extension_part, command_part = self.split_command(command_name)
 
             if len(self.command_results) > 0:
@@ -245,7 +261,7 @@ class ExecuteCommandMixin(object):
                     LOG.error('Tried to execute %(command)s, agent is still '
                               'executing %(last)s', {'command': command_name,
                                                      'last': last_command})
-                    raise errors.CommandExecutionError('agent is busy')
+                    raise errors.AgentIsBusy(last_command.command_name)
 
             try:
                 ext = self.get_extension(extension_part)
@@ -265,8 +281,6 @@ class ExecuteCommandMixin(object):
                 # recorded as a failed SyncCommandResult with an error message
                 LOG.exception('Command execution error: %s', e)
                 result = SyncCommandResult(command_name, kwargs, False, e)
-            LOG.info('Command %(name)s completed: %(result)s',
-                     {'name': command_name, 'result': result})
             self.command_results[result.id] = result
             return result
 
@@ -282,7 +296,7 @@ def async_command(command_name, validator=None):
     def async_decorator(func):
         func.command_name = command_name
 
-        @six.wraps(func)
+        @functools.wraps(func)
         def wrapper(self, **command_params):
             # Run a validator before passing everything off to async.
             # validators should raise exceptions or return silently.
@@ -293,10 +307,13 @@ def async_command(command_name, validator=None):
             # know about the mode
             bound_func = functools.partial(func, self)
 
-            return AsyncCommandResult(command_name,
-                                      command_params,
-                                      bound_func,
-                                      agent=self.agent).start()
+            ret = AsyncCommandResult(command_name,
+                                     command_params,
+                                     bound_func,
+                                     agent=self.agent).start()
+            LOG.info('Asynchronous command %(name)s started execution',
+                     {'name': command_name})
+            return ret
         return wrapper
     return async_decorator
 
@@ -311,7 +328,7 @@ def sync_command(command_name, validator=None):
     def sync_decorator(func):
         func.command_name = command_name
 
-        @six.wraps(func)
+        @functools.wraps(func)
         def wrapper(self, **command_params):
             # Run a validator before invoking the function.
             # validators should raise exceptions or return silently.
@@ -319,6 +336,9 @@ def sync_command(command_name, validator=None):
                 validator(self, **command_params)
 
             result = func(self, **command_params)
+            LOG.info('Synchronous command %(name)s completed: %(result)s',
+                     {'name': command_name,
+                      'result': utils.remove_large_keys(result)})
             return SyncCommandResult(command_name,
                                      command_params,
                                      True,
@@ -326,3 +346,25 @@ def sync_command(command_name, validator=None):
 
         return wrapper
     return sync_decorator
+
+
+_EXT_MANAGER = None
+
+
+def init_ext_manager(agent):
+    global _EXT_MANAGER
+    _EXT_MANAGER = extension.ExtensionManager(
+        namespace='ironic_python_agent.extensions',
+        invoke_on_load=True,
+        propagate_map_exceptions=True,
+        invoke_kwds={'agent': agent},
+    )
+    return _EXT_MANAGER
+
+
+def get_extension(name):
+    if _EXT_MANAGER is None:
+        raise errors.ExtensionError('Extension manager is not initialized')
+    ext = _EXT_MANAGER[name].obj
+    ext.ext_mgr = _EXT_MANAGER
+    return ext

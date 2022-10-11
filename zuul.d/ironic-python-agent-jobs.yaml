@@ -1,0 +1,172 @@
+# disabling dstat because of
+# https://bugs.launchpad.net/ubuntu/+source/dstat/+bug/1866619
+- job:
+    name: ironic-ipa-base
+    parent: ironic-base
+    irrelevant-files:
+      - ^examples/.*$
+      - ^test-requirements.txt$
+      - ^.*\.rst$
+      - ^doc/.*$
+      - ^ironic_python_agent/tests/.*$
+      - ^releasenotes/.*$
+      - ^setup.cfg$
+      - ^tools/.*$
+      - ^tox.ini$
+    required-projects:
+      - openstack/ironic-lib
+    vars:
+      # The default is 1GB, we need a little more to prevent OOMs killing the jobs
+      configure_swap_size: 8192
+      devstack_localrc:
+        IRONIC_BUILD_DEPLOY_RAMDISK: True
+        IRONIC_VM_COUNT: 2
+        IRONIC_VM_SPECS_RAM: 2750
+        # This matches the default in ironic-base, specifying for clarity
+        IRONIC_RAMDISK_TYPE: dib
+      devstack_services:
+        dstat: false
+
+# used by diskimage-builder and IPA-builder
+- job:
+    name: ipa-tempest-bios-ipmi-direct-src
+    parent: ironic-ipa-base
+    vars:
+      devstack_services:
+        s-account: True
+        s-container: True
+        s-object: True
+        s-proxy: True
+      devstack_localrc:
+        IRONIC_BOOT_MODE: bios
+        IRONIC_DEFAULT_DEPLOY_INTERFACE: direct
+        SWIFT_ENABLE_TEMPURLS: True
+        SWIFT_TEMPURL_KEY: secretkey
+
+- job:
+    name: ipa-tempest-uefi-redfish-vmedia-src
+    parent: ironic-ipa-base
+    required-projects:
+      - opendev.org/openstack/sushy-tools
+    vars:
+      devstack_services:
+        s-account: True
+        s-container: True
+        s-object: True
+        s-proxy: True
+      devstack_localrc:
+        IRONIC_BOOT_MODE: uefi
+        IRONIC_DEPLOY_DRIVER: redfish
+        IRONIC_ENABLED_BOOT_INTERFACES: redfish-virtual-media
+        IRONIC_ENABLED_HARDWARE_TYPES: redfish
+        IRONIC_ENABLED_POWER_INTERFACES: redfish
+        IRONIC_ENABLED_MANAGEMENT_INTERFACES: redfish
+        IRONIC_TEMPEST_WHOLE_DISK_IMAGE: True
+        IRONIC_VM_EPHEMERAL_DISK: 0
+        # Ironic has to master a new image, and this CAN take longer as a
+        # result and makes this job VERY sensitive to heavy disk IO of the
+        # underlying hypervisor/cloud.
+        IRONIC_CALLBACK_TIMEOUT: 800
+        SWIFT_ENABLE_TEMPURLS: True
+        SWIFT_TEMPURL_KEY: secretkey
+
+# used by ironic-python-agent-builder
+- job:
+    name: ipa-tempest-ironic-inspector-src
+    parent: ironic-ipa-base
+    required-projects:
+      # These are in addition to what is in ironic-ipa-base
+      - openstack/ironic-inspector
+      - openstack/python-ironic-inspector-client
+    vars:
+      devstack_localrc:
+        DEVSTACK_GATE_TEMPEST_REGEX: InspectorBasicTest
+        DEVSTACK_GATE_IRONIC_INSPECTOR: 1
+        IRONIC_VM_EPHEMERAL_DISK: 0
+        IRONIC_TEMPEST_WHOLE_DISK_IMAGE: True
+        IRONIC_INSPECTOR_BUILD_RAMDISK: True
+        SWIFT_ENABLE_TEMPURLS: True
+        SWIFT_TEMPURL_KEY: secretkey
+      devstack_plugins:
+        ironic-inspector: https://opendev.org/openstack/ironic-inspector
+
+- job:
+    # Security testing for known issues
+    name: ipa-tox-bandit
+    parent: openstack-tox
+    timeout: 2400
+    vars:
+      tox_envlist: bandit
+    irrelevant-files:
+      - ^examples/.*$
+      - ^test-requirements.txt$
+      - ^.*\.rst$
+      - ^doc/.*$
+      - ^ironic_python_agent/tests/.*$
+      - ^releasenotes/.*$
+      - ^setup.cfg$
+      - ^tools/(?!bandit.yml).*$
+      - ^tox.ini$
+
+- job:
+    name: ipa-tox-examples
+    parent: openstack-tox
+    timeout: 600
+    vars:
+      tox_envlist: examples
+    irrelevant-files:
+      - ^test-requirements.txt$
+      - ^.*\.rst$
+      - ^doc/.*$
+      - ^ironic_python_agent/tests/.*$
+      - ^releasenotes/.*$
+      - ^setup.cfg$
+      - ^tools/(?!bandit.yml).*$
+      - ^tox.ini$
+
+# used by ironic-python-agent-builder
+- job:
+    name: ironic-standalone-ipa-src
+    parent: ironic-standalone
+    description: Test ironic standalone with IPA from source
+    vars:
+      devstack_localrc:
+        IRONIC_BUILD_DEPLOY_RAMDISK: True
+        # NOTE(dtantsur): the ansible deploy doesn't depend on IPA code,
+        # excluding it from the enabled list to save gate time.
+        IRONIC_ENABLED_DEPLOY_INTERFACES: "direct"
+
+- job:
+    name: metalsmith-integration-ipa-src-uefi
+    parent: metalsmith-integration-glance-centos8-uefi
+    required-projects:
+      - openstack/ironic-python-agent
+      - openstack/ironic-python-agent-builder
+      - openstack/ironic-lib
+    vars:
+      devstack_localrc:
+        # Don't waste time on cleaning, it's checked everywhere else
+        IRONIC_AUTOMATED_CLEAN_ENABLED: False
+        IRONIC_BUILD_DEPLOY_RAMDISK: True
+
+- job:
+    name: metalsmith-integration-ipa-src-legacy
+    parent: metalsmith-integration-glance-centos8-legacy
+    required-projects:
+      - openstack/ironic-python-agent
+      - openstack/ironic-python-agent-builder
+      - openstack/ironic-lib
+    vars:
+      devstack_localrc:
+        # Don't waste time on cleaning, it's checked everywhere else
+        IRONIC_AUTOMATED_CLEAN_ENABLED: False
+        IRONIC_BUILD_DEPLOY_RAMDISK: True
+
+# used by ironic-python-agent-builder
+- job:
+    name: ipa-tempest-bios-ipmi-direct-tinyipa-src
+    parent: ipa-tempest-bios-ipmi-direct-src
+    vars:
+      devstack_localrc:
+        IRONIC_RAMDISK_TYPE: tinyipa
+        IRONIC_VM_SPECS_RAM: 1024

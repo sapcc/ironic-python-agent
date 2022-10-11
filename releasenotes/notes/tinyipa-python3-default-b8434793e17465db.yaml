@@ -1,0 +1,7 @@
+---
+prelude: >
+    Starting with this release, the Ironic Python Agent images used in the CI
+    (tinyipa) run with Python 3 by default.
+other:
+  - Change the Python default version used to build and run the Ironic
+    Python Agent in the Tiny Core based image to 3.6.

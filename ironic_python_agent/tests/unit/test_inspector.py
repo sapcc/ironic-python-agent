@@ -17,13 +17,14 @@ import collections
 import copy
 import os
 import time
+from unittest import mock
 
-import mock
 from oslo_concurrency import processutils
 from oslo_config import cfg
 import requests
 import stevedore
 
+from ironic_python_agent import config
 from ironic_python_agent import errors
 from ironic_python_agent import hardware
 from ironic_python_agent import inspector
@@ -48,9 +49,14 @@ class AcceptingFailure(mock.Mock):
 
 class TestMisc(base.IronicAgentTest):
     def test_default_collector_loadable(self):
-        ext = inspector.extension_manager([inspector.DEFAULT_COLLECTOR])
-        self.assertIs(ext[inspector.DEFAULT_COLLECTOR].plugin,
-                      inspector.collect_default)
+        defaults = config.INSPECTION_DEFAULT_COLLECTOR.split(',')
+        # default should go first
+        self.assertEqual('default', defaults[0])
+        # logs much go last
+        self.assertEqual('logs', defaults[-1])
+        ext = inspector.extension_manager(defaults)
+        for collector in defaults:
+            self.assertTrue(callable(ext[collector].plugin))
 
     def test_raise_on_wrong_collector(self):
         self.assertRaisesRegex(errors.InspectionError,
@@ -79,6 +85,26 @@ class TestInspect(base.IronicAgentTest):
         self.mock_collect.assert_called_with_failure()
         mock_call.assert_called_with_failure()
         self.assertEqual('uuid1', result)
+
+    @mock.patch('ironic_lib.mdns.get_endpoint', autospec=True)
+    def test_mdns(self, mock_mdns, mock_ext_mgr, mock_call):
+        CONF.set_override('inspection_callback_url', 'mdns')
+        mock_mdns.return_value = 'http://example', {
+            'ipa_inspection_collectors': 'one,two'
+        }
+        mock_ext_mgr.return_value = [self.mock_ext]
+        mock_call.return_value = {'uuid': 'uuid1'}
+
+        result = inspector.inspect()
+
+        self.mock_collect.assert_called_with_failure()
+        mock_call.assert_called_with_failure()
+        self.assertEqual('uuid1', result)
+
+        self.assertEqual('http://example/v1/continue',
+                         CONF.inspection_callback_url)
+        self.assertEqual('one,two', CONF.inspection_collectors)
+        self.assertEqual(['one', 'two'], mock_ext_mgr.call_args[1]['names'])
 
     def test_collectors_option(self, mock_ext_mgr, mock_call):
         CONF.set_override('inspection_collectors', 'foo,bar')
@@ -115,11 +141,11 @@ class TestInspect(base.IronicAgentTest):
         mock_call.return_value = None
         mock_ext_mgr.return_value = [self.mock_ext]
 
-        result = inspector.inspect()
+        self.assertRaises(errors.InspectionError,
+                          inspector.inspect)
 
         self.mock_collect.assert_called_with_failure()
         mock_call.assert_called_with_failure()
-        self.assertIsNone(result)
 
 
 @mock.patch.object(requests, 'post', autospec=True)
@@ -165,6 +191,16 @@ class TestCallInspector(base.IronicAgentTest):
                                           data='{"data": 42, "error": null}')
         self.assertIsNone(res)
 
+    @mock.patch.object(inspector, '_RETRY_WAIT', 0.01)
+    def test_inspector_retries(self, mock_post):
+        mock_post.side_effect = requests.exceptions.ConnectionError
+        failures = utils.AccumulatedFailures()
+        data = collections.OrderedDict(data=42)
+        self.assertRaises(requests.exceptions.ConnectionError,
+                          inspector.call_inspector,
+                          data, failures)
+        self.assertEqual(5, mock_post.call_count)
+
 
 class BaseDiscoverTest(base.IronicAgentTest):
     def setUp(self):
@@ -204,11 +240,17 @@ class BaseDiscoverTest(base.IronicAgentTest):
         self.data = {}
 
 
+@mock.patch.object(hardware, 'get_managers', autospec=True)
 @mock.patch.object(inspector, 'wait_for_dhcp', autospec=True)
 @mock.patch.object(hardware, 'dispatch_to_managers', autospec=True)
 class TestCollectDefault(BaseDiscoverTest):
-    def test_ok(self, mock_dispatch, mock_wait_for_dhcp):
+    def test_ok(self, mock_dispatch, mock_wait_for_dhcp, mock_get_mgrs):
+        mgrs = [{'name': 'extra', 'version': '1.42'},
+                {'name': 'generic', 'version': '1.1'}]
         mock_dispatch.return_value = self.inventory
+        mock_get_mgrs.return_value = [
+            mock.Mock(**{'get_version.return_value': item}) for item in mgrs
+        ]
 
         inspector.collect_default(self.data, self.failures)
 
@@ -216,15 +258,37 @@ class TestCollectDefault(BaseDiscoverTest):
             self.assertTrue(self.data['inventory'][key])
 
         self.assertEqual('boot:if', self.data['boot_interface'])
-        self.assertEqual(self.inventory['disks'][0].name,
+        self.assertEqual(self.inventory['disks'][2].name,
                          self.data['root_disk'].name)
+        self.assertEqual({'collectors': ['default', 'logs'], 'managers': mgrs},
+                         self.data['configuration'])
 
         mock_dispatch.assert_called_once_with('list_hardware_info')
         mock_wait_for_dhcp.assert_called_once_with()
 
-    def test_no_root_disk(self, mock_dispatch, mock_wait_for_dhcp):
+    def test_cache_hardware_info(self, mock_dispatch, mock_wait_for_dhcp,
+                                 mock_get_mgrs):
+        mgrs = [{'name': 'extra', 'version': '1.42'},
+                {'name': 'generic', 'version': '1.1'}]
+        mock_dispatch.return_value = self.inventory
+        mock_get_mgrs.return_value = [
+            mock.Mock(**{'get_version.return_value': item}) for item in mgrs
+        ]
+
+        inspector.collect_default(self.data, self.failures)
+        inspector.collect_default(self.data, self.failures)
+        # Hardware is cached, so only one call is made
+        mock_dispatch.assert_called_once_with('list_hardware_info')
+
+    def test_no_root_disk(self, mock_dispatch, mock_wait_for_dhcp,
+                          mock_get_mgrs):
+        mgrs = [{'name': 'extra', 'version': '1.42'},
+                {'name': 'generic', 'version': '1.1'}]
         mock_dispatch.return_value = self.inventory
         self.inventory['disks'] = []
+        mock_get_mgrs.return_value = [
+            mock.Mock(**{'get_version.return_value': item}) for item in mgrs
+        ]
 
         inspector.collect_default(self.data, self.failures)
 
@@ -233,6 +297,8 @@ class TestCollectDefault(BaseDiscoverTest):
 
         self.assertEqual('boot:if', self.data['boot_interface'])
         self.assertNotIn('root_disk', self.data)
+        self.assertEqual({'collectors': ['default', 'logs'], 'managers': mgrs},
+                         self.data['configuration'])
 
         mock_dispatch.assert_called_once_with('list_hardware_info')
         mock_wait_for_dhcp.assert_called_once_with()
@@ -309,22 +375,29 @@ class TestCollectPciDevicesInfo(base.IronicAgentTest):
         self.data = {}
         self.failures = utils.AccumulatedFailures()
 
+    @mock.patch.object(os.path, 'isfile', autospec=True)
     @mock.patch.object(os.path, 'isdir', autospec=True)
-    def test_success(self, mock_isdir, mock_listdir):
+    def test_success(self, mock_isdir, mock_isfile, mock_listdir):
         subdirs = ['foo', 'bar']
         mock_listdir.return_value = subdirs
+        mock_isfile.return_value = True
         mock_isdir.return_value = True
-        reads = ['0x1234', '0x5678', '0x9876', '0x5432']
-        expected_pci_devices = [{'vendor_id': '1234', 'product_id': '5678'},
-                                {'vendor_id': '9876', 'product_id': '5432'}]
+        reads = ['0x1234', '0x5678', '0x060000', '0x01',
+                 '0x9876', '0x5432', '0x030000', '0x00']
+        expected_pci_devices = [{'vendor_id': '1234', 'product_id': '5678',
+                                 'class': '060000', 'revision': '01',
+                                 'bus': 'foo'},
+                                {'vendor_id': '9876', 'product_id': '5432',
+                                 'class': '030000', 'revision': '00',
+                                 'bus': 'bar'}]
 
         mock_open = mock.mock_open()
-        with mock.patch('six.moves.builtins.open', mock_open):
+        with mock.patch('builtins.open', mock_open):
             mock_read = mock_open.return_value.read
             mock_read.side_effect = reads
             inspector.collect_pci_devices_info(self.data, self.failures)
 
-        self.assertEqual(2 * len(subdirs), mock_open.call_count)
+        self.assertEqual(4 * len(subdirs), mock_open.call_count)
         self.assertListEqual(expected_pci_devices, self.data['pci_devices'])
 
     def test_wrong_path(self, mock_listdir):
@@ -335,24 +408,28 @@ class TestCollectPciDevicesInfo(base.IronicAgentTest):
         self.assertNotIn('pci_devices', self.data)
         self.assertEqual(1, len(self.failures._failures))
 
+    @mock.patch.object(os.path, 'isfile', autospec=True)
     @mock.patch.object(os.path, 'isdir', autospec=True)
-    def test_bad_pci_device_info(self, mock_isdir, mock_listdir):
+    def test_bad_pci_device_info(self, mock_isdir, mock_isfile, mock_listdir):
         subdirs = ['foo', 'bar', 'baz']
         mock_listdir.return_value = subdirs
+        mock_isfile.return_value = False
         mock_isdir.return_value = True
-        reads = ['0x1234', '0x5678', '0x9876', IOError, IndexError,
-                 '0x5432']
-        expected_pci_devices = [{'vendor_id': '1234', 'product_id': '5678'}]
+        reads = ['0x1234', '0x5678', '0x060000', '0x9876',
+                 IOError, IndexError]
+        expected_pci_devices = [{'vendor_id': '1234', 'product_id': '5678',
+                                 'class': '060000', 'revision': None,
+                                 'bus': 'foo'}]
 
         mock_open = mock.mock_open()
-        with mock.patch('six.moves.builtins.open', mock_open):
+        with mock.patch('builtins.open', mock_open):
             mock_read = mock_open.return_value.read
             mock_read.side_effect = reads
             inspector.collect_pci_devices_info(self.data, self.failures)
 
         # note(sborkows): due to throwing IOError, the corresponding mock_open
-        # will not be called, so there are 5 mock_open calls in total
-        self.assertEqual(5, mock_open.call_count)
+        # will not be called, so there are 6 mock_open calls in total
+        self.assertEqual(6, mock_open.call_count)
         self.assertListEqual(expected_pci_devices, self.data['pci_devices'])
 
 
@@ -362,7 +439,7 @@ class TestWaitForDhcp(base.IronicAgentTest):
     def setUp(self):
         super(TestWaitForDhcp, self).setUp()
         CONF.set_override('inspection_dhcp_wait_timeout',
-                          inspector.DEFAULT_DHCP_WAIT_TIMEOUT)
+                          config.INSPECTION_DEFAULT_DHCP_WAIT_TIMEOUT)
 
     @mock.patch.object(time, 'sleep', autospec=True)
     def test_all(self, mocked_sleep, mocked_dispatch):

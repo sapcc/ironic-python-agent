@@ -1,0 +1,5 @@
+---
+fixes:
+  - |
+    Fixes detection of physical memory amount on AArch64 that was caused by
+    different output of the ``lshw`` utility.

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from unittest import mock
+
 from stevedore import extension
 
 from ironic_python_agent import errors
@@ -116,6 +117,17 @@ class TestExecuteCommandMixin(test_base.IronicAgentTest):
                          result.command_status)
         self.assertEqual(exc, result.command_error)
 
+    def test_busy(self):
+        fake_extension = FakeExtension()
+        self.agent.ext_mgr = extension.ExtensionManager.make_test_instance(
+            [extension.Extension('fake', None, FakeExtension, fake_extension)])
+
+        self.agent.command_results = {
+            'fake': base.BaseCommandResult('name', {})
+        }
+        self.assertRaises(errors.AgentIsBusy,
+                          self.agent.execute_command, 'fake.fake_sync_command')
+
 
 class TestExtensionDecorators(test_base.IronicAgentTest):
     def setUp(self):
@@ -136,6 +148,12 @@ class TestExtensionDecorators(test_base.IronicAgentTest):
         self.assertEqual({'result': 'fake_async_command: v1'},
                          result.command_result)
         self.agent.force_heartbeat.assert_called_once_with()
+
+    def test_wait_async_command_success(self):
+        result = self.extension.execute('fake_async_command', param='v1')
+        self.assertIsInstance(result, base.AsyncCommandResult)
+        result = result.wait()
+        self.assertEqual({'result': 'fake_async_command: v1'}, result)
 
     def test_async_command_success_without_agent(self):
         extension = FakeExtension(agent=None)
@@ -169,6 +187,11 @@ class TestExtensionDecorators(test_base.IronicAgentTest):
         self.assertIsInstance(result.command_error, ExecutionError)
         self.assertIsNone(result.command_result)
         self.agent.force_heartbeat.assert_called_once_with()
+
+    def test_wait_async_command_execution_failure(self):
+        result = self.extension.execute('fake_async_command', param='v2')
+        self.assertIsInstance(result, base.AsyncCommandResult)
+        self.assertRaises(ExecutionError, result.wait)
 
     def test_async_command_name(self):
         self.assertEqual(

@@ -45,11 +45,15 @@ Project status, features, and bugs are tracked on StoryBoard:
 
 Developer documentation can be found here:
 
-  https://docs.openstack.org/ironic-python-agent
+  https://docs.openstack.org/ironic-python-agent/latest/
 
 Release notes for the project are available at:
 
   https://docs.openstack.org/releasenotes/ironic-python-agent/
+
+Source code repository for the project is located at:
+
+  https://opendev.org/openstack/ironic-python-agent/
 
 IRC channel:
     #openstack-ironic

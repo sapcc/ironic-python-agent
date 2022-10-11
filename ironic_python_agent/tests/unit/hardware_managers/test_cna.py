@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import os
+from unittest import mock
 
-import mock
 from oslo_concurrency import processutils
 from oslo_config import cfg
 
@@ -84,7 +84,7 @@ class TestIntelCnaHardwareManager(base.IronicAgentTest):
         mock_exists.return_value = True
         mock_listdir.return_value = ['foo', 'bar']
         write_mock = mock.mock_open()
-        with mock.patch('six.moves.builtins.open', write_mock, create=True):
+        with mock.patch('builtins.open', write_mock, create=True):
             cna._disable_embedded_lldp_agent_in_cna_card()
             write_mock().write.assert_called_with('lldp stop')
             self.assertFalse(mock_log.warning.called)
@@ -107,23 +107,39 @@ class TestIntelCnaHardwareManager(base.IronicAgentTest):
         listdir_dict = ['foo', 'bar']
         mock_listdir.return_value = listdir_dict
         write_mock = mock.mock_open()
-        with mock.patch('six.moves.builtins.open', write_mock, create=True):
+        with mock.patch('builtins.open', write_mock, create=True):
             write_mock.side_effect = IOError('fake error')
             cna._disable_embedded_lldp_agent_in_cna_card()
             expected_log_message = ('Failed to disable the embedded LLDP on '
                                     'Intel CNA network card. Addresses of '
-                                    'failed pci devices: {}'
-                                    .format(str(listdir_dict).strip('[]')))
+                                    'failed pci devices: %s',
+                                    str(listdir_dict).strip('[]'))
             mock_log.warning.assert_called_once_with(expected_log_message)
 
     @mock.patch.object(cna, 'LOG', autospec=True)
     @mock.patch.object(cna, '_detect_cna_card', autospec=True)
-    def test_evaluate_hardware_support(self, mock_detect_card, mock_log):
+    def test_evaluate_hardware_support_with_collect_lldp_disabled(
+            self, mock_detect_card, mock_log):
         mock_detect_card.return_value = True
         expected_support = hardware.HardwareSupport.MAINLINE
         actual_support = self.hardware.evaluate_hardware_support()
         self.assertEqual(expected_support, actual_support)
         mock_log.debug.assert_called_once()
+
+    @mock.patch.object(cna, 'LOG', autospec=True)
+    @mock.patch.object(cna, '_detect_cna_card', autospec=True)
+    @mock.patch.object(cna, '_disable_embedded_lldp_agent_in_cna_card',
+                       autospec=True)
+    def test_evaluate_hardware_support_with_collect_lldp_enabled(
+            self, mock_disable_lldp_agent, mock_detect_card, mock_log):
+        self.config(collect_lldp=True)
+        mock_detect_card.return_value = True
+        expected_support = hardware.HardwareSupport.MAINLINE
+        actual_support = self.hardware.evaluate_hardware_support()
+        self.assertEqual(expected_support, actual_support)
+        mock_log.debug.assert_called_once()
+        mock_log.info.assert_called_once()
+        mock_disable_lldp_agent.assert_called_once()
 
     @mock.patch.object(cna, 'LOG', autospec=True)
     @mock.patch.object(cna, '_detect_cna_card', autospec=True)
@@ -135,19 +151,3 @@ class TestIntelCnaHardwareManager(base.IronicAgentTest):
         actual_support = self.hardware.evaluate_hardware_support()
         self.assertEqual(expected_support, actual_support)
         mock_log.debug.assert_called_once()
-
-    @mock.patch.object(hardware.GenericHardwareManager, 'collect_lldp_data',
-                       autospec=True)
-    def test_collect_lldp_data(self, mock_super_collect):
-        iface_names = ['eth0', 'eth1']
-        returned_lldp_data = [
-            (0, 'foo'),
-            (1, 'bar'),
-        ]
-        mock_super_collect.return_value = returned_lldp_data
-        with mock.patch.object(cna, '_disable_embedded_lldp_agent_in_cna_card',
-                               autospec=True):
-            result = self.hardware.collect_lldp_data(iface_names)
-            mock_super_collect.assert_called_once_with(self.hardware,
-                                                       iface_names)
-            self.assertEqual(returned_lldp_data, result)

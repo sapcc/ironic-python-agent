@@ -28,12 +28,10 @@ in rescue mode.
 The below has information about supported images that may be built to use
 rescue mode.
 
-CoreOS
-------
+DIB
+---
 
-The CoreOS image supports rescue mode when used with DHCP tenant networks. You
-may follow the normal process for `building a CoreOS ironic-python-agent
-image`_ to create an image that supports rescue mode.
+The DIB image supports rescue mode when used with DHCP tenant networks.
 
 After the ``finalize_rescue`` command completes, DHCP will be configured on all
 network interfaces, and a `rescue` user will be created with the specified
@@ -49,5 +47,4 @@ After the ``finalize_rescue`` command completes, DHCP will be configured on all
 network interfaces, and a `rescue` user will be created with the specified
 ``rescue_password``.
 
-.. _`building a CoreOS ironic-python-agent image`: https://github.com/openstack/ironic-python-agent/tree/master/imagebuild/coreos/README.rst
-.. _`build a TinyIPA image`: https://github.com/openstack/ironic-python-agent/tree/master/imagebuild/tinyipa/README.rst
+.. _build a TinyIPA image: https://docs.openstack.org/ironic-python-agent-builder/latest/admin/tinyipa.html
