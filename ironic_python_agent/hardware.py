@@ -1756,6 +1756,9 @@ class GenericHardwareManager(HardwareManager):
         """
         info = node.get('driver_internal_info', {})
         npasses = info.get('agent_erase_devices_iterations', 1)
+        if npasses < 1:
+            return True
+
         args = ('shred', '--force')
 
         if info.get('agent_erase_devices_zeroize', True):
