@@ -15,7 +15,6 @@ import random
 import select
 import threading
 
-from ironic_lib import exception
 from oslo_config import cfg
 from oslo_log import log
 
@@ -90,7 +89,7 @@ class IronicInspection(threading.Thread):
                         interval = min(interval * self.backoff_factor,
                                        self.max_delay)
 
-                    except exception.ServiceLookupFailure as e:
+                    except errors.ServiceLookupFailure as e:
                         # Likely a mDNS lookup failure. We should
                         # keep retrying.
                         LOG.error('Error looking up introspection '
@@ -101,7 +100,7 @@ class IronicInspection(threading.Thread):
                                        self.max_delay)
                     except Exception as e:
                         # General failure such as requests ConnectionError
-                        LOG.error('Error occured attempting to connect to '
+                        LOG.error('Error occurred attempting to connect to '
                                   'connect to the introspection service. '
                                   'Error: %(err)s',
                                   {'err': e})

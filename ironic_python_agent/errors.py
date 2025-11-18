@@ -156,6 +156,24 @@ class ImageDownloadError(RESTError):
         super(ImageDownloadError, self).__init__(details)
 
 
+class ImageDownloadTimeoutError(RESTError):
+    """Raised when an image download operation exceeds its allowed time limit.
+
+    """
+    status_code = 408
+    message = 'Image download timeout'
+
+    def __init__(self, image_id, msg):
+        details = 'Download of image {} failed: {}'.format(image_id, msg)
+        self.secondary_message = msg
+        super(ImageDownloadTimeoutError, self).__init__(details)
+
+
+class ImageDownloadOutofSpaceError(ImageDownloadError):
+    """Raised when an image download fails due to insufficient storage."""
+    pass
+
+
 class ImageChecksumError(RESTError):
     """Error raised when an image fails to verify against its checksum."""
 
@@ -263,6 +281,15 @@ class HardwareManagerMethodNotFound(RESTError):
         super(HardwareManagerMethodNotFound, self).__init__(details)
 
 
+class HardwareManagerConfigurationError(RESTError):
+    """Error raised when a hardware manager has invalid configuration."""
+
+    message = 'Hardware manager configuration error'
+
+    def __init__(self, details=None):
+        super(HardwareManagerConfigurationError, self).__init__(details)
+
+
 class IncompatibleHardwareMethodError(RESTError):
     """Error raised when HardwareManager method incompatible with hardware."""
 
@@ -312,6 +339,15 @@ class DeploymentError(RESTError):
         super(DeploymentError, self).__init__(details)
 
 
+class ServicingError(RESTError):
+    """Error raised when a service step fails."""
+
+    message = 'Service step failed'
+
+    def __init__(self, details=None):
+        super(ServicingError, self).__init__(details)
+
+
 class IncompatibleNumaFormatError(RESTError):
     """Error raised when unexpected format data in NUMA node."""
 
@@ -341,7 +377,7 @@ class ClockSyncError(RESTError):
 
 
 class HeartbeatConnectionError(IronicAPIError):
-    """Transitory connection failure occured attempting to contact the API."""
+    """Transitory connection failure occurred attempting to contact the API."""
 
     message = ("Error attempting to heartbeat - Possible transitory network "
                "failure or blocking port may be present.")
@@ -367,3 +403,44 @@ class ProtectedDeviceError(CleaningError):
 
         self.message = details
         super(CleaningError, self).__init__(details)
+
+
+class InvalidImage(DeploymentError):
+    """Error raised when an image fails validation for any reason."""
+
+    message = 'The provided image is not valid for use'
+
+    def __init__(self, details=None):
+        super(InvalidImage, self).__init__(details)
+
+
+class FileSystemNotSupported(RESTError):
+    """Error raised when a file system is not supported."""
+
+    def __init__(self, fs):
+        details = (f"Failed to create a file system. File system {fs} is not "
+                   "supported.")
+        self.message = details
+        super(RESTError, self).__init__(details)
+
+
+class InvalidMetricConfig(RESTError):
+    """Error raised when a metric config is invalid."""
+
+    message = "Invalid value for metrics config option."
+
+
+class MetricsNotSupported(RESTError):
+    """Error raised when a metrics action is not supported."""
+
+    message = ("Metrics action is not supported. You may need to "
+               "adjust the [metrics] section in ironic.conf.")
+
+
+class ServiceLookupFailure(RESTError):
+    """Error raised when an mdns service lookup fails."""
+
+    def __init__(self, service="unknown"):
+        details = f"Cannot find {service} service through multicast."
+        self.message = details
+        super(RESTError, self).__init__(details)

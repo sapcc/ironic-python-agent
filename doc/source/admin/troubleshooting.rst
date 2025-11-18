@@ -38,66 +38,58 @@ devuser element example::
   export DIB_DEV_USER_AUTHORIZED_KEYS=$HOME/.ssh/id_rsa.pub
   ironic-python-agent-builder -o /path/to/custom-ipa -e devuser debian
 
-tinyipa
-~~~~~~~
-
-If you want to enable SSH access to the image,
-set ``AUTHORIZE_SSH`` variable in your shell to ``true`` before building
-the tinyipa image::
-
-  export AUTHORIZE_SSH=true
-
-By default it will use default public RSA (or, if not available, DSA)
-key of the user running the build (``~/.ssh/id_{rsa,dsa}.pub``).
-
-To provide other public SSH key, export full path to it in your shell
-before building tinyipa as follows::
-
-  export SSH_PUBLIC_KEY=/path/to/other/ssh/public/key
-
-The user to use for access is default Tiny Core Linux user ``tc``.
-This user has no password and has password-less ``sudo`` permissions.
-Installed SSH server is configured to disable Password authentication.
-
 Access via console
 ------------------
 If you need to use console access, passwords must be enabled there are a
 couple ways to enable this depending on how the IPA image was created:
 
-ironic-python-agent-builder
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ironic-python-agent-builder: dynamic-login
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Users wishing to use password access can be add the dynamic-login [0]_ or the
 devuser element [1]_
 
-The dynamic-login element allows the operator to change the root password
-dynamically when the image boots. Kernel command line parameters
+The dynamic-login element allows the operator to change the root password or
+SSH key dynamically when the image boots. Kernel command line parameters
 are used to do this.
 
-dynamic-login element example::
+Generate a password hash with following command:
 
-  Generate a ENCRYPTED_PASSWORD with the openssl passwd -1 command
-  Add rootpwd="$ENCRYPTED_PASSWORD" value on the kernel_append_params setting in /etc/ironic/ironic.conf
-  Restart the ironic-conductor with the command service ironic-conductor restart
+.. code-block:: console
 
-Users can also be added to DIB built IPA images with the devuser element [1]_
+    $ openssl passwd -6 -stdin | sed 's/\$/\$\$/g'
 
-Install ``ironic-python-agent-builder`` following the guide [2]_
+Add ``rootpwd="<openssl output>"`` value or add ``sshkey="<ssh public key>"``
+on the ``kernel_append_params``
+setting in the Ironic configuration file (``/etc/ironic/ironic.conf``).
+Restart the ironic-conductor e.g. with
 
-Example::
+.. code-block:: console
+
+   $ sudo systemctl restart ironic-conductor
+
+.. warning::
+
+   * The ``sed`` command is used to escape the ``$`` symbols in the
+     configuration file.
+
+   * The quotation marks around the value are mandatory.
+
+   * Only 1 password or 1 SSH key is supported.
+
+ironic-python-agent-builder: devuser
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Users can also be added to DIB built IPA images with the devuser element [1]_.
+Install ``ironic-python-agent-builder`` following the guide [2]_.
+
+Example:
+
+.. code-block:: bash
 
   export DIB_DEV_USER_USERNAME=username
   export DIB_DEV_USER_PWDLESS_SUDO=yes
   export DIB_DEV_USER_PASSWORD=PASSWORD
   ironic-python-agent-builder -o /path/to/custom-ipa -e devuser debian
-
-tinyipa
-~~~~~~~
-
-The image built with scripts provided in ``tinyipa`` folder
-of `Ironic Python Agent Builder <https://opendev.org/openstack/ironic-python-agent-builder>`_
-repository by default auto-logins the default
-Tiny Core Linux user ``tc`` to the console.
-This user has no password and has password-less ``sudo`` permissions.
 
 How to pause the IPA for debugging
 ----------------------------------
@@ -166,7 +158,8 @@ Cleaning halted with ProtectedDeviceError
 
 The IPA service has halted cleaning as one of the block devices within or
 attached to the bare metal node contains a class of filesystem which **MAY**
-cause irreparable harm to a potentially running cluster if accidently removed.
+cause irreparable harm to a potentially running cluster if accidentally
+removed.
 
 These filesystems *may* be used for only local storage and as a result be
 safe to erase. However if a shared block device is in use, such as a device
@@ -196,7 +189,7 @@ I'm okay with deleting, how do I tell IPA to clean the disk(s)?
 ---------------------------------------------------------------
 
 Four potential ways exist to signal to IPA. Please note, all of these options
-require access either to the ndoe in Ironic's API or ability to modify Ironic
+require access either to the node in Ironic's API or ability to modify Ironic
 configuration.
 
 Via Ironic
@@ -254,6 +247,6 @@ Edit /etc/ironic_python_agent/ironic_python_agent.conf and set the parameter
 
 References
 ==========
-.. [0] `Dynamic-login DIB element`: https://github.com/openstack/diskimage-builder/tree/master/diskimage_builder/elements/dynamic-login
-.. [1] `DevUser DIB element`: https://github.com/openstack/diskimage-builder/tree/master/diskimage_builder/elements/devuser
-.. [2] `ironic-python-agent-builder`: https://docs.openstack.org/ironic-python-agent-builder/latest/install/index.html
+.. [0] Dynamic-login DIB element: https://github.com/openstack/diskimage-builder/tree/master/diskimage_builder/elements/dynamic-login
+.. [1] DevUser DIB element: https://github.com/openstack/diskimage-builder/tree/master/diskimage_builder/elements/devuser
+.. [2] ironic-python-agent-builder: https://docs.openstack.org/ironic-python-agent-builder/latest/install/index.html

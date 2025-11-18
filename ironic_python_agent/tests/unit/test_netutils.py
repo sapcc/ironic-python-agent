@@ -224,7 +224,7 @@ class TestNetutils(base.IronicAgentTest):
         sock2.bind.assert_called_with(('eth1', netutils.LLDP_ETHERTYPE))
 
         sock1.recv.assert_called_with(1600)
-        sock2.recv.not_called()
+        sock2.recv.assert_not_called()
 
         self.assertEqual(1, sock1.close.call_count)
         self.assertEqual(1, sock2.close.call_count)
@@ -261,8 +261,8 @@ class TestNetutils(base.IronicAgentTest):
         sock1.bind.assert_called_with(('eth0', netutils.LLDP_ETHERTYPE))
         sock2.bind.assert_called_with(('eth1', netutils.LLDP_ETHERTYPE))
 
-        sock1.recv.not_called()
-        sock2.recv.not_called()
+        sock1.recv.assert_not_called()
+        sock2.recv.assert_not_called()
 
         self.assertEqual(1, sock1.close.call_count)
         self.assertEqual(1, sock2.close.call_count)
@@ -394,3 +394,27 @@ class TestNetutils(base.IronicAgentTest):
     def test_wrap_ipv6_with_ipv4(self):
         res = netutils.wrap_ipv6('1.2.3.4')
         self.assertEqual('1.2.3.4', res)
+
+    @mock.patch('os.readlink', autospec=True)
+    def test_get_interface_pci_address(self, mock_read):
+        mock_read.return_value = '../../../0000:02:00.0'
+        addr = netutils.get_interface_pci_address('ens160')
+        self.assertEqual('0000:02:00.0', addr)
+
+    @mock.patch('os.readlink', autospec=True)
+    def test_get_interface_pci_address_notfound(self, mock_read):
+        mock_read.side_effect = FileNotFoundError
+        addr = netutils.get_interface_pci_address('ens160')
+        self.assertIsNone(addr)
+
+    @mock.patch('os.readlink', autospec=True)
+    def test_get_interface_driver(self, mock_read):
+        mock_read.return_value = '../../../../bus/pci/drivers/e1000e'
+        addr = netutils.get_interface_driver('ens160')
+        self.assertEqual('e1000e', addr)
+
+    @mock.patch('os.readlink', autospec=True)
+    def test_get_interface_driver_notfound(self, mock_read):
+        mock_read.side_effect = FileNotFoundError
+        driver = netutils.get_interface_driver('ens160')
+        self.assertIsNone(driver)

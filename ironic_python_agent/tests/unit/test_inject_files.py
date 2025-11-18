@@ -21,8 +21,8 @@ from ironic_python_agent import inject_files
 from ironic_python_agent.tests.unit import base
 
 
-@mock.patch('ironic_lib.utils.mounted', autospec=True)
-@mock.patch('ironic_lib.disk_utils.list_partitions', autospec=True)
+@mock.patch('ironic_python_agent.utils.mounted', autospec=True)
+@mock.patch('ironic_python_agent.disk_utils.list_partitions', autospec=True)
 @mock.patch('ironic_python_agent.hardware.dispatch_to_managers',
             lambda _call: '/dev/fake')
 class TestFindPartitionWithPath(base.IronicAgentTest):
@@ -96,7 +96,7 @@ class TestFindAndMountPath(base.IronicAgentTest):
             inject_files._find_and_mount_path('/etc', None,
                                               '/dev/fake').__enter__)
 
-    @mock.patch('ironic_lib.utils.mounted', autospec=True)
+    @mock.patch('ironic_python_agent.utils.mounted', autospec=True)
     def test_with_on_as_path(self, mock_mount):
         mock_mount.return_value.__enter__.return_value = '/mount/path'
         with inject_files._find_and_mount_path('/etc/sysctl.d/my.conf',
@@ -105,7 +105,7 @@ class TestFindAndMountPath(base.IronicAgentTest):
             self.assertEqual('/mount/path/etc/sysctl.d/my.conf', result)
         mock_mount.assert_called_once_with('/dev/on')
 
-    @mock.patch('ironic_lib.utils.mounted', autospec=True)
+    @mock.patch('ironic_python_agent.utils.mounted', autospec=True)
     def test_with_on_as_number(self, mock_mount):
         mock_mount.return_value.__enter__.return_value = '/mount/path'
         with inject_files._find_and_mount_path('/etc/sysctl.d/my.conf',
@@ -113,7 +113,7 @@ class TestFindAndMountPath(base.IronicAgentTest):
             self.assertEqual('/mount/path/etc/sysctl.d/my.conf', result)
         mock_mount.assert_called_once_with('/dev/fake2')
 
-    @mock.patch('ironic_lib.utils.mounted', autospec=True)
+    @mock.patch('ironic_python_agent.utils.mounted', autospec=True)
     def test_with_on_as_number_nvme(self, mock_mount):
         mock_mount.return_value.__enter__.return_value = '/mount/path'
         with inject_files._find_and_mount_path('/etc/sysctl.d/my.conf',
@@ -228,7 +228,7 @@ class TestInjectOne(base.IronicAgentTest):
         with open(self.path, 'rb') as fp:
             self.assertEqual(b'content', fp.read())
         self.assertEqual(0o602, stat.S_IMODE(os.stat(self.path).st_mode))
-        # Exising directories do not change their permissions
+        # Existing directories do not change their permissions
         self.assertNotEqual(0o703, stat.S_IMODE(os.stat(self.dirpath).st_mode))
 
         mock_find_and_mount.assert_called_once_with(fl['path'], None,

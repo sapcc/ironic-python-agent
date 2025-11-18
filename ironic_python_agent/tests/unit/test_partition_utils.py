@@ -15,17 +15,21 @@ import shutil
 import tempfile
 from unittest import mock
 
-from ironic_lib import disk_partitioner
-from ironic_lib import disk_utils
-from ironic_lib import exception
-from ironic_lib import utils
 from oslo_concurrency import processutils
+from oslo_config import cfg
 import requests
 
+from ironic_python_agent import disk_partitioner
+from ironic_python_agent import disk_utils
 from ironic_python_agent import errors
 from ironic_python_agent import hardware
 from ironic_python_agent import partition_utils
+from ironic_python_agent import qemu_img
 from ironic_python_agent.tests.unit import base
+from ironic_python_agent import utils
+
+
+CONF = cfg.CONF
 
 
 @mock.patch.object(shutil, 'copyfileobj', autospec=True)
@@ -109,7 +113,7 @@ class GetConfigdriveTestCase(base.IronicAgentTest):
 
     def test_get_configdrive_bad_url(self, mock_requests, mock_copy):
         mock_requests.side_effect = requests.exceptions.RequestException
-        self.assertRaises(exception.InstanceDeployFailure,
+        self.assertRaises(errors.DeploymentError,
                           partition_utils.get_configdrive,
                           'http://1.2.3.4/cd', 'fake-node-uuid')
         self.assertFalse(mock_copy.called)
@@ -117,13 +121,13 @@ class GetConfigdriveTestCase(base.IronicAgentTest):
     def test_get_configdrive_bad_status_code(self, mock_requests, mock_copy):
         mock_requests.return_value = mock.MagicMock(text='Not found',
                                                     status_code=404)
-        self.assertRaises(exception.InstanceDeployFailure,
+        self.assertRaises(errors.DeploymentError,
                           partition_utils.get_configdrive,
                           'http://1.2.3.4/cd', 'fake-node-uuid')
         self.assertFalse(mock_copy.called)
 
     def test_get_configdrive_base64_error(self, mock_requests, mock_copy):
-        self.assertRaises(exception.InstanceDeployFailure,
+        self.assertRaises(errors.DeploymentError,
                           partition_utils.get_configdrive,
                           'malformed', 'fake-node-uuid')
         self.assertFalse(mock_copy.called)
@@ -134,7 +138,7 @@ class GetConfigdriveTestCase(base.IronicAgentTest):
         mock_requests.return_value = mock.MagicMock(content='Zm9vYmFy',
                                                     status_code=200)
         mock_copy.side_effect = IOError
-        self.assertRaises(exception.InstanceDeployFailure,
+        self.assertRaises(errors.DeploymentError,
                           partition_utils.get_configdrive,
                           'http://1.2.3.4/cd', 'fake-node-uuid')
         mock_requests.assert_called_once_with('http://1.2.3.4/cd',
@@ -163,10 +167,10 @@ class GetLabelledPartitionTestCases(base.IronicAgentTest):
                                                         self.node_uuid)
         self.assertEqual(part_result, result)
         execute_calls = [
-            mock.call('partprobe', self.dev, run_as_root=True, attempts=10),
+            mock.call('partprobe', self.dev, attempts=10),
             mock.call('lsblk', '-Po', 'name,label', self.dev,
                       check_exit_code=[0, 1],
-                      use_standard_locale=True, run_as_root=True)
+                      use_standard_locale=True)
         ]
         mock_execute.assert_has_calls(execute_calls)
 
@@ -179,10 +183,10 @@ class GetLabelledPartitionTestCases(base.IronicAgentTest):
                                                         self.node_uuid)
         self.assertEqual(part_result, result)
         execute_calls = [
-            mock.call('partprobe', self.dev, run_as_root=True, attempts=10),
+            mock.call('partprobe', self.dev, attempts=10),
             mock.call('lsblk', '-Po', 'name,label', self.dev,
                       check_exit_code=[0, 1],
-                      use_standard_locale=True, run_as_root=True)
+                      use_standard_locale=True)
         ]
         mock_execute.assert_has_calls(execute_calls)
 
@@ -194,10 +198,10 @@ class GetLabelledPartitionTestCases(base.IronicAgentTest):
                                                         self.node_uuid)
         self.assertIsNone(result)
         execute_calls = [
-            mock.call('partprobe', self.dev, run_as_root=True, attempts=10),
+            mock.call('partprobe', self.dev, attempts=10),
             mock.call('lsblk', '-Po', 'name,label', self.dev,
                       check_exit_code=[0, 1],
-                      use_standard_locale=True, run_as_root=True)
+                      use_standard_locale=True)
         ]
         mock_execute.assert_has_calls(execute_calls)
 
@@ -207,32 +211,32 @@ class GetLabelledPartitionTestCases(base.IronicAgentTest):
                         'NAME="fake13" LABEL="%s"\n' %
                         (label, label))
         mock_execute.side_effect = [(None, ''), (lsblk_output, '')]
-        self.assertRaisesRegex(exception.InstanceDeployFailure,
+        self.assertRaisesRegex(errors.DeploymentError,
                                'fake .*fake12 .*fake13',
                                partition_utils.get_labelled_partition,
                                self.dev, self.config_part_label,
                                self.node_uuid)
         execute_calls = [
-            mock.call('partprobe', self.dev, run_as_root=True, attempts=10),
+            mock.call('partprobe', self.dev, attempts=10),
             mock.call('lsblk', '-Po', 'name,label', self.dev,
                       check_exit_code=[0, 1],
-                      use_standard_locale=True, run_as_root=True)
+                      use_standard_locale=True)
         ]
         mock_execute.assert_has_calls(execute_calls)
 
     @mock.patch.object(partition_utils.LOG, 'error', autospec=True)
     def test_get_partition_exc(self, mock_log, mock_execute):
         mock_execute.side_effect = processutils.ProcessExecutionError
-        self.assertRaisesRegex(exception.InstanceDeployFailure,
+        self.assertRaisesRegex(errors.DeploymentError,
                                'Failed to retrieve partition labels',
                                partition_utils.get_labelled_partition,
                                self.dev, self.config_part_label,
                                self.node_uuid)
         execute_calls = [
-            mock.call('partprobe', self.dev, run_as_root=True, attempts=10),
+            mock.call('partprobe', self.dev, attempts=10),
             mock.call('lsblk', '-Po', 'name,label', self.dev,
                       check_exit_code=[0, 1],
-                      use_standard_locale=True, run_as_root=True)
+                      use_standard_locale=True)
         ]
         mock_execute.assert_has_calls(execute_calls)
         self.assertEqual(1, mock_log.call_count)
@@ -249,7 +253,7 @@ class IsDiskLargerThanMaxSizeTestCases(base.IronicAgentTest):
         result = partition_utils._is_disk_larger_than_max_size(self.dev,
                                                                self.node_uuid)
         mock_execute.assert_called_once_with('blockdev', '--getsize64',
-                                             '/dev/fake', run_as_root=True,
+                                             '/dev/fake',
                                              use_standard_locale=True)
         return result
 
@@ -268,12 +272,12 @@ class IsDiskLargerThanMaxSizeTestCases(base.IronicAgentTest):
     @mock.patch.object(partition_utils.LOG, 'error', autospec=True)
     def test_is_disk_larger_than_max_size_exc(self, mock_log, mock_execute):
         mock_execute.side_effect = processutils.ProcessExecutionError
-        self.assertRaisesRegex(exception.InstanceDeployFailure,
+        self.assertRaisesRegex(errors.DeploymentError,
                                'Failed to get size of disk',
                                partition_utils._is_disk_larger_than_max_size,
                                self.dev, self.node_uuid)
         mock_execute.assert_called_once_with('blockdev', '--getsize64',
-                                             '/dev/fake', run_as_root=True,
+                                             '/dev/fake',
                                              use_standard_locale=True)
         self.assertEqual(1, mock_log.call_count)
 
@@ -311,7 +315,7 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
 
     def test_no_root_partition(self):
         self.mock_ibd.return_value = False
-        self.assertRaises(exception.InstanceDeployFailure,
+        self.assertRaises(errors.DeploymentError,
                           partition_utils.work_on_disk, self.dev, self.root_mb,
                           self.swap_mb, self.ephemeral_mb,
                           self.ephemeral_format, self.image_path,
@@ -330,7 +334,7 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
         self.mock_ibd.side_effect = iter([True, False])
         calls = [mock.call(self.root_part),
                  mock.call(self.swap_part)]
-        self.assertRaises(exception.InstanceDeployFailure,
+        self.assertRaises(errors.DeploymentError,
                           partition_utils.work_on_disk, self.dev, self.root_mb,
                           self.swap_mb, self.ephemeral_mb,
                           self.ephemeral_format, self.image_path,
@@ -359,7 +363,7 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
         calls = [mock.call(root_part),
                  mock.call(swap_part),
                  mock.call(ephemeral_part)]
-        self.assertRaises(exception.InstanceDeployFailure,
+        self.assertRaises(errors.DeploymentError,
                           partition_utils.work_on_disk, self.dev, self.root_mb,
                           self.swap_mb, ephemeral_mb, ephemeral_format,
                           self.image_path, self.node_uuid)
@@ -390,7 +394,7 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
         calls = [mock.call(root_part),
                  mock.call(swap_part),
                  mock.call(configdrive_part)]
-        self.assertRaises(exception.InstanceDeployFailure,
+        self.assertRaises(errors.DeploymentError,
                           partition_utils.work_on_disk, self.dev, self.root_mb,
                           self.swap_mb, self.ephemeral_mb,
                           self.ephemeral_format, self.image_path,
@@ -448,13 +452,15 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
     @mock.patch.object(utils, 'mkfs', lambda fs, path, label=None: None)
     @mock.patch.object(disk_utils, 'block_uuid', lambda p: 'uuid')
     @mock.patch.object(disk_utils, 'populate_image', lambda image_path,
-                       root_path, conv_flags=None: None)
+                       root_path, conv_flags=None, source_format=None,
+                       is_raw=False: None)
     def test_gpt_disk_label(self):
         ephemeral_part = '/dev/fake-part1'
         swap_part = '/dev/fake-part2'
         root_part = '/dev/fake-part3'
         ephemeral_mb = 256
         ephemeral_format = 'exttest'
+        source_format = 'raw'
 
         self.mock_mp.return_value = {'ephemeral': ephemeral_part,
                                      'swap': swap_part,
@@ -467,7 +473,8 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
                                      self.swap_mb, ephemeral_mb,
                                      ephemeral_format,
                                      self.image_path, self.node_uuid,
-                                     disk_label='gpt', conv_flags=None)
+                                     disk_label='gpt', conv_flags=None,
+                                     source_format=source_format, is_raw=True)
         self.assertEqual(self.mock_ibd.call_args_list, calls)
         self.mock_mp.assert_called_once_with(self.dev, self.root_mb,
                                              self.swap_mb, ephemeral_mb,
@@ -487,6 +494,8 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
         """Test that we create a fat filesystem with UEFI localboot."""
         root_part = '/dev/fake-part1'
         efi_part = '/dev/fake-part2'
+        source_format = 'format'
+
         self.mock_mp.return_value = {'root': root_part,
                                      'efi system partition': efi_part}
         self.mock_ibd.return_value = True
@@ -497,7 +506,8 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
                                      self.swap_mb, self.ephemeral_mb,
                                      self.ephemeral_format,
                                      self.image_path, self.node_uuid,
-                                     boot_mode="uefi")
+                                     boot_mode="uefi",
+                                     source_format=source_format, is_raw=False)
 
         self.mock_mp.assert_called_once_with(self.dev, self.root_mb,
                                              self.swap_mb, self.ephemeral_mb,
@@ -510,8 +520,9 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
         self.assertEqual(self.mock_ibd.call_args_list, mock_ibd_calls)
         mock_mkfs.assert_called_once_with(fs='vfat', path=efi_part,
                                           label='efi-part')
-        mock_populate_image.assert_called_once_with(self.image_path,
-                                                    root_part, conv_flags=None)
+        mock_populate_image.assert_called_once_with(
+            self.image_path, root_part, conv_flags=None,
+            source_format=source_format, is_raw=False)
         mock_block_uuid.assert_any_call(root_part)
         mock_block_uuid.assert_any_call(efi_part)
         mock_trigger_device_rescan.assert_called_once_with(self.dev)
@@ -590,6 +601,7 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
         root_part = '/dev/fake-part3'
         ephemeral_mb = 256
         ephemeral_format = 'exttest'
+        fmt = 'format'
 
         self.mock_mp.return_value = {'ephemeral': ephemeral_part,
                                      'swap': swap_part,
@@ -599,11 +611,15 @@ class WorkOnDiskTestCase(base.IronicAgentTest):
                                      self.swap_mb, ephemeral_mb,
                                      ephemeral_format,
                                      self.image_path, self.node_uuid,
-                                     disk_label='gpt', conv_flags='sparse')
+                                     disk_label='gpt', conv_flags='sparse',
+                                     source_format=fmt,
+                                     is_raw=False)
 
         mock_populate_image.assert_called_once_with(self.image_path,
                                                     root_part,
-                                                    conv_flags='sparse')
+                                                    conv_flags='sparse',
+                                                    source_format=fmt,
+                                                    is_raw=False)
 
 
 class CreateConfigDriveTestCases(base.IronicAgentTest):
@@ -649,7 +665,10 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
                                                        self.config_part_label,
                                                        self.node_uuid)
         self.assertFalse(mock_list_partitions.called)
-        self.assertFalse(mock_execute.called)
+        mock_execute.assert_has_calls([
+            mock.call('mount', '-o', 'ro', '-t', 'auto',
+                      '/dev/fake-part1', mock.ANY),
+            mock.call('umount', mock.ANY)])
         self.assertFalse(mock_table_type.called)
         mock_dd.assert_called_with(configdrive_file, configdrive_part)
         mock_unlink.assert_called_with(configdrive_file)
@@ -690,11 +709,73 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
                                                       config_url)
         mock_execute.assert_has_calls([
             mock.call('sgdisk', '-n', '0:-64MB:0', '-u', '0:fake-uuid',
-                      self.dev, run_as_root=True),
+                      self.dev),
             mock.call('sync'),
             mock.call('udevadm', 'settle'),
-            mock.call('partprobe', self.dev, attempts=10, run_as_root=True),
-            mock.call('sgdisk', '-v', self.dev, run_as_root=True),
+            mock.call('partprobe', self.dev, attempts=10),
+            mock.call('udevadm', 'settle'),
+            mock.call('sgdisk', '-v', self.dev),
+            mock.call('udevadm', 'settle'),
+            mock.call('test', '-e', expected_part, attempts=15,
+                      delay_on_retry=True)
+        ])
+
+        mock_table_type.assert_called_with(self.dev)
+        mock_fix_gpt_partition.assert_called_with(self.dev, self.node_uuid)
+        mock_dd.assert_called_with(configdrive_file, expected_part)
+        mock_unlink.assert_called_with(configdrive_file)
+
+    @mock.patch('oslo_utils.uuidutils.generate_uuid', lambda: 'fake-uuid')
+    @mock.patch.object(partition_utils, '_try_build_fat32_config_drive',
+                       autospec=True)
+    @mock.patch.object(partition_utils, '_does_config_drive_work',
+                       autospec=True)
+    @mock.patch.object(utils, 'execute', autospec=True)
+    @mock.patch.object(utils, 'unlink_without_raise',
+                       autospec=True)
+    @mock.patch.object(disk_utils, 'dd',
+                       autospec=True)
+    @mock.patch.object(disk_utils, 'fix_gpt_partition',
+                       autospec=True)
+    @mock.patch.object(disk_utils, 'get_partition_table_type',
+                       autospec=True)
+    @mock.patch.object(partition_utils, 'get_partition',
+                       autospec=True)
+    @mock.patch.object(partition_utils, 'get_labelled_partition',
+                       autospec=True)
+    @mock.patch.object(partition_utils, 'get_configdrive',
+                       autospec=True)
+    def test_create_partition_gpt_with_fallback(
+            self, mock_get_configdrive,
+            mock_get_labelled_partition,
+            mock_get_partition_by_uuid,
+            mock_table_type,
+            mock_fix_gpt_partition,
+            mock_dd, mock_unlink, mock_execute,
+            mock_config_drive_work,
+            mock_rebuild_config_drive):
+        config_url = 'http://1.2.3.4/cd'
+        configdrive_file = '/tmp/xyz'
+        configdrive_mb = 10
+
+        mock_get_configdrive.return_value = (configdrive_mb, configdrive_file)
+        mock_get_labelled_partition.return_value = None
+
+        mock_table_type.return_value = 'gpt'
+        expected_part = '/dev/fake4'
+        mock_get_partition_by_uuid.return_value = expected_part
+        mock_config_drive_work.return_value = False
+
+        partition_utils.create_config_drive_partition(self.node_uuid, self.dev,
+                                                      config_url)
+        mock_execute.assert_has_calls([
+            mock.call('sgdisk', '-n', '0:-64MB:0', '-u', '0:fake-uuid',
+                      self.dev),
+            mock.call('sync'),
+            mock.call('udevadm', 'settle'),
+            mock.call('partprobe', self.dev, attempts=10),
+            mock.call('udevadm', 'settle'),
+            mock.call('sgdisk', '-v', self.dev),
 
             mock.call('udevadm', 'settle'),
             mock.call('test', '-e', expected_part, attempts=15,
@@ -705,6 +786,74 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
         mock_fix_gpt_partition.assert_called_with(self.dev, self.node_uuid)
         mock_dd.assert_called_with(configdrive_file, expected_part)
         mock_unlink.assert_called_with(configdrive_file)
+        mock_config_drive_work.assert_called_once_with(expected_part)
+        mock_rebuild_config_drive.assert_called_once_with(expected_part,
+                                                          configdrive_file)
+
+    @mock.patch('oslo_utils.uuidutils.generate_uuid', lambda: 'fake-uuid')
+    @mock.patch.object(partition_utils, '_try_build_fat32_config_drive',
+                       autospec=True)
+    @mock.patch.object(partition_utils, '_does_config_drive_work',
+                       autospec=True)
+    @mock.patch.object(utils, 'execute', autospec=True)
+    @mock.patch.object(utils, 'unlink_without_raise',
+                       autospec=True)
+    @mock.patch.object(disk_utils, 'dd',
+                       autospec=True)
+    @mock.patch.object(disk_utils, 'fix_gpt_partition',
+                       autospec=True)
+    @mock.patch.object(disk_utils, 'get_partition_table_type',
+                       autospec=True)
+    @mock.patch.object(partition_utils, 'get_partition',
+                       autospec=True)
+    @mock.patch.object(partition_utils, 'get_labelled_partition',
+                       autospec=True)
+    @mock.patch.object(partition_utils, 'get_configdrive',
+                       autospec=True)
+    def test_create_partition_gpt_use_vfat(
+            self, mock_get_configdrive,
+            mock_get_labelled_partition,
+            mock_get_partition_by_uuid,
+            mock_table_type,
+            mock_fix_gpt_partition,
+            mock_dd, mock_unlink, mock_execute,
+            mock_config_drive_work,
+            mock_rebuild_config_drive):
+        config_url = 'http://1.2.3.4/cd'
+        configdrive_file = '/tmp/xyz'
+        configdrive_mb = 10
+
+        CONF.set_override('config_drive_rebuild', True)
+        mock_get_configdrive.return_value = (configdrive_mb, configdrive_file)
+        mock_get_labelled_partition.return_value = None
+
+        mock_table_type.return_value = 'gpt'
+        expected_part = '/dev/fake4'
+        mock_get_partition_by_uuid.return_value = expected_part
+        mock_config_drive_work.return_value = True
+
+        partition_utils.create_config_drive_partition(self.node_uuid, self.dev,
+                                                      config_url)
+        mock_execute.assert_has_calls([
+            mock.call('sgdisk', '-n', '0:-64MB:0', '-u', '0:fake-uuid',
+                      self.dev),
+            mock.call('sync'),
+            mock.call('udevadm', 'settle'),
+            mock.call('partprobe', self.dev, attempts=10),
+            mock.call('udevadm', 'settle'),
+            mock.call('sgdisk', '-v', self.dev),
+            mock.call('udevadm', 'settle'),
+            mock.call('test', '-e', expected_part, attempts=15,
+                      delay_on_retry=True)
+        ])
+
+        mock_table_type.assert_called_with(self.dev)
+        mock_fix_gpt_partition.assert_called_with(self.dev, self.node_uuid)
+        mock_dd.assert_not_called()
+        mock_unlink.assert_called_with(configdrive_file)
+        mock_config_drive_work.assert_not_called()
+        mock_rebuild_config_drive.assert_called_once_with(expected_part,
+                                                          configdrive_file)
 
     @mock.patch.object(disk_utils, 'count_mbr_partitions', autospec=True)
     @mock.patch.object(utils, 'execute', autospec=True)
@@ -782,19 +931,20 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
             parted_call = mock.call('parted', '-a', 'optimal', '-s',
                                     '--', self.dev, 'mkpart',
                                     'primary', 'fat32', 2097087,
-                                    2097151, run_as_root=True)
+                                    2097151)
         else:
             self.assertEqual(0, mock_log.call_count)
             parted_call = mock.call('parted', '-a', 'optimal', '-s',
                                     '--', self.dev, 'mkpart',
                                     'primary', 'fat32', '-64MiB',
-                                    '-0', run_as_root=True)
+                                    '-0')
         mock_execute.assert_has_calls([
             parted_call,
             mock.call('sync'),
             mock.call('udevadm', 'settle'),
-            mock.call('partprobe', self.dev, attempts=10, run_as_root=True),
-            mock.call('sgdisk', '-v', self.dev, run_as_root=True),
+            mock.call('partprobe', self.dev, attempts=10),
+            mock.call('udevadm', 'settle'),
+            mock.call('sgdisk', '-v', self.dev),
             mock.call('udevadm', 'settle'),
             mock.call('test', '-e', expected_part, attempts=15,
                       delay_on_retry=True)
@@ -880,7 +1030,7 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
         # 2 primary partitions, 0 logical partitions
         mock_count.return_value = (2, 0)
 
-        self.assertRaisesRegex(exception.InstanceDeployFailure,
+        self.assertRaisesRegex(errors.DeploymentError,
                                'Disk partitioning failed on device',
                                partition_utils.create_config_drive_partition,
                                self.node_uuid, self.dev, config_url)
@@ -889,12 +1039,12 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
         mock_execute.assert_has_calls([
             mock.call('parted', '-a', 'optimal', '-s', '--',
                       self.dev, 'mkpart', 'primary',
-                      'fat32', '-64MiB', '-0',
-                      run_as_root=True),
+                      'fat32', '-64MiB', '-0'),
             mock.call('sync'),
             mock.call('udevadm', 'settle'),
-            mock.call('partprobe', self.dev, attempts=10, run_as_root=True),
-            mock.call('sgdisk', '-v', self.dev, run_as_root=True),
+            mock.call('partprobe', self.dev, attempts=10),
+            mock.call('udevadm', 'settle'),
+            mock.call('sgdisk', '-v', self.dev),
         ])
 
         self.assertEqual(2, mock_list_partitions.call_count)
@@ -952,7 +1102,7 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
 
         mock_execute.side_effect = processutils.ProcessExecutionError
 
-        self.assertRaisesRegex(exception.InstanceDeployFailure,
+        self.assertRaisesRegex(errors.DeploymentError,
                                'Failed to create config drive on disk',
                                partition_utils.create_config_drive_partition,
                                self.node_uuid, self.dev, config_url)
@@ -960,8 +1110,7 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
         mock_get_configdrive.assert_called_with(config_url, self.node_uuid)
         mock_execute.assert_called_with('parted', '-a', 'optimal', '-s', '--',
                                         self.dev, 'mkpart', 'primary',
-                                        'fat32', '-64MiB', '-0',
-                                        run_as_root=True)
+                                        'fat32', '-64MiB', '-0')
         self.assertEqual(1, mock_list_partitions.call_count)
         mock_fix_gpt_partition.assert_called_with(self.dev, self.node_uuid)
         mock_table_type.assert_called_with(self.dev)
@@ -1011,7 +1160,7 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
         # 4 primary partitions, 0 logical partitions
         mock_count.return_value = (4, 0)
 
-        self.assertRaisesRegex(exception.InstanceDeployFailure,
+        self.assertRaisesRegex(errors.DeploymentError,
                                'Config drive cannot be created for node',
                                partition_utils.create_config_drive_partition,
                                self.node_uuid, self.dev, config_url)
@@ -1041,7 +1190,7 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
         mock_get_configdrive.return_value = (configdrive_mb, configdrive_file)
         mock_get_labelled_partition.return_value = None
 
-        self.assertRaisesRegex(exception.InstanceDeployFailure,
+        self.assertRaisesRegex(errors.DeploymentError,
                                'Config drive size exceeds maximum limit',
                                partition_utils.create_config_drive_partition,
                                self.node_uuid, self.dev, config_url)
@@ -1073,7 +1222,7 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
         mock_get_labelled_partition.return_value = None
         mock_count.side_effect = ValueError('Booooom')
 
-        self.assertRaisesRegex(exception.InstanceDeployFailure,
+        self.assertRaisesRegex(errors.DeploymentError,
                                'Failed to check the number of primary ',
                                partition_utils.create_config_drive_partition,
                                self.node_uuid, self.dev, config_url)
@@ -1088,12 +1237,14 @@ class CreateConfigDriveTestCases(base.IronicAgentTest):
 # NOTE(TheJulia): trigger_device_rescan is systemwide thus pointless
 # to execute in the file test case. Also, CI unit test jobs lack sgdisk.
 @mock.patch.object(disk_utils, 'trigger_device_rescan', autospec=True)
-@mock.patch.object(utils, 'wait_for_disk_to_become_available', autospec=True)
+@mock.patch.object(disk_utils, 'wait_for_disk_to_become_available',
+                   autospec=True)
 @mock.patch.object(disk_utils, 'is_block_device', autospec=True)
 @mock.patch.object(disk_utils, 'block_uuid', autospec=True)
 @mock.patch.object(disk_utils, 'dd', autospec=True)
-@mock.patch.object(disk_utils, 'convert_image', autospec=True)
+@mock.patch.object(qemu_img, 'convert_image', autospec=True)
 @mock.patch.object(utils, 'mkfs', autospec=True)
+@mock.patch.object(disk_utils, 'populate_image', autospec=True)
 # NOTE(dtantsur): destroy_disk_metadata resets file size, disabling it
 @mock.patch.object(disk_utils, 'destroy_disk_metadata', autospec=True)
 class RealFilePartitioningTestCase(base.IronicAgentTest):
@@ -1121,48 +1272,33 @@ class RealFilePartitioningTestCase(base.IronicAgentTest):
         utils.execute('dd', 'if=/dev/zero', 'of=%s' % self.file.name,
                       'bs=1', 'count=0', 'seek=20MiB')
 
-    @staticmethod
-    def _run_without_root(func, *args, **kwargs):
-        """Make sure root is not required when using utils.execute."""
-        real_execute = utils.execute
-
-        def fake_execute(*cmd, **kwargs):
-            kwargs['run_as_root'] = False
-            return real_execute(*cmd, **kwargs)
-
-        with mock.patch.object(utils, 'execute', fake_execute):
-            return func(*args, **kwargs)
-
-    def test_different_sizes(self, mock_destroy, mock_mkfs, mock_convert,
-                             mock_dd, mock_block_uuid, mock_is_block,
-                             mock_wait, mock_trigger_rescan):
+    def test_different_sizes(self, mock_destroy, mock_populate, mock_mkfs,
+                             mock_convert, mock_dd, mock_block_uuid,
+                             mock_is_block, mock_wait, mock_trigger_rescan):
         # NOTE(dtantsur): Keep this list in order with expected partitioning
         fields = ['ephemeral_mb', 'swap_mb', 'root_mb']
         variants = ((0, 0, 12), (4, 2, 8), (0, 4, 10), (5, 0, 10))
         for variant in variants:
             kwargs = dict(zip(fields, variant))
-            self._run_without_root(partition_utils.work_on_disk,
-                                   self.file.name, ephemeral_format='ext4',
-                                   node_uuid='', image_path='path', **kwargs)
-            part_table = self._run_without_root(
-                disk_utils.list_partitions, self.file.name)
+            partition_utils.work_on_disk(
+                self.file.name, ephemeral_format='ext4',
+                node_uuid='', image_path='path', **kwargs)
+            part_table = disk_utils.list_partitions(self.file.name)
             for part, expected_size in zip(part_table, filter(None, variant)):
                 self.assertEqual(expected_size, part['size'],
                                  "comparison failed for %s" % list(variant))
 
-    def test_whole_disk(self, mock_destroy, mock_mkfs, mock_convert, mock_dd,
-                        mock_block_uuid, mock_is_block, mock_wait,
-                        mock_trigger_rescan):
+    def test_whole_disk(self, mock_destroy, mock_populate, mock_mkfs,
+                        mock_convert, mock_dd, mock_block_uuid,
+                        mock_is_block, mock_wait, mock_trigger_rescan):
         # 6 MiB ephemeral + 3 MiB swap + 9 MiB root + 1 MiB for MBR
         # + 1 MiB MAGIC == 20 MiB whole disk
         # TODO(dtantsur): figure out why we need 'magic' 1 more MiB
         # and why the is different on Ubuntu and Fedora (see below)
-        self._run_without_root(partition_utils.work_on_disk, self.file.name,
-                               root_mb=9, ephemeral_mb=6, swap_mb=3,
-                               ephemeral_format='ext4', node_uuid='',
-                               image_path='path')
-        part_table = self._run_without_root(
-            disk_utils.list_partitions, self.file.name)
+        partition_utils.work_on_disk(
+            self.file.name, root_mb=9, ephemeral_mb=6, swap_mb=3,
+            ephemeral_format='ext4', node_uuid='', image_path='path')
+        part_table = disk_utils.list_partitions(self.file.name)
         sizes = [part['size'] for part in part_table]
         # NOTE(dtantsur): parted in Ubuntu 12.04 will occupy the last MiB,
         # parted in Fedora 20 won't - thus two possible variants for last part
@@ -1184,7 +1320,7 @@ class TestGetPartition(base.IronicAgentTest):
         lsblk_output = ('''KNAME="test" UUID="" TYPE="disk"
         KNAME="test1" UUID="256a39e3-ca3c-4fb8-9cc2-b32eec441f47" TYPE="part"
         KNAME="test2" UUID="%s" TYPE="part"''' % self.fake_root_uuid)
-        mock_execute.side_effect = (None, None, [lsblk_output])
+        mock_execute.side_effect = ((None, ''), (None, ''), (lsblk_output, ''))
 
         root_part = partition_utils.get_partition(
             self.fake_dev, self.fake_root_uuid)
@@ -1202,7 +1338,7 @@ class TestGetPartition(base.IronicAgentTest):
         KNAME="test1" UUID="256a39e3-ca3c-4fb8-9cc2-b32eec441f47" TYPE="part"
         KNAME="test2" UUID="" TYPE="part"''')
         mock_execute.side_effect = (
-            None, None, [lsblk_output],
+            (None, ''), (None, ''), (lsblk_output, ''),
             processutils.ProcessExecutionError('boom'),
             processutils.ProcessExecutionError('kaboom'))
 
@@ -1223,7 +1359,7 @@ class TestGetPartition(base.IronicAgentTest):
         KNAME="test2" UUID="" TYPE="part"''')
         findfs_output = ('/dev/loop0\n', None)
         mock_execute.side_effect = (
-            None, None, [lsblk_output],
+            (None, ''), (None, ''), (lsblk_output, ''),
             processutils.ProcessExecutionError('boom'),
             findfs_output)
 
@@ -1258,9 +1394,9 @@ class TestGetPartition(base.IronicAgentTest):
         mock_is_md_device.side_effect = [False, False]
         lsblk_output = ('''KNAME="test" UUID="" TYPE="disk"
         KNAME="test1" UUID="256a39e3-ca3c-4fb8-9cc2-b32eec441f47" TYPE="part"
-        KNAME="test2" UUID="903e7bf9-8a13-4f7f-811b-25dc16faf6f7" TYPE="part" \
+        KNAME="test2" UUID="903e7bf9-8a13-4f7f-811b-25dc16faf6f7" TYPE="part"\
                       LABEL="%s"''' % self.fake_root_uuid)
-        mock_execute.side_effect = (None, None, [lsblk_output])
+        mock_execute.side_effect = ((None, ''), (None, ''), (lsblk_output, ''))
 
         root_part = partition_utils.get_partition(
             self.fake_dev, self.fake_root_uuid)
@@ -1277,7 +1413,7 @@ class TestGetPartition(base.IronicAgentTest):
         lsblk_output = ('''KNAME="test" UUID="" TYPE="disk"
         KNAME="test1" UUID="256a39e3-ca3c-4fb8-9cc2-b32eec441f47" TYPE="part"
         KNAME="test2" PARTUUID="%s" TYPE="part"''' % self.fake_root_uuid)
-        mock_execute.side_effect = (None, None, [lsblk_output])
+        mock_execute.side_effect = ((None, ''), (None, ''), (lsblk_output, ''))
 
         root_part = partition_utils.get_partition(
             self.fake_dev, self.fake_root_uuid)
@@ -1288,3 +1424,105 @@ class TestGetPartition(base.IronicAgentTest):
                     mock.call('lsblk', '-PbioKNAME,UUID,PARTUUID,TYPE,LABEL',
                               self.fake_dev)]
         mock_execute.assert_has_calls(expected)
+
+
+@mock.patch.object(utils, 'execute', autospec=True)
+class TestConfigDriveTestRecovery(base.IronicAgentTest):
+
+    fake_dev = '/dev/fake'
+    configdrive_file = '/tmp/config-drive'
+
+    def test__does_config_drive_work(self, mock_execute):
+        self.assertTrue(partition_utils._does_config_drive_work(self.fake_dev))
+        mock_execute.assert_has_calls([
+            mock.call('mount', '-o', 'ro', '-t', 'auto', self.fake_dev,
+                      mock.ANY),
+            mock.call('umount', mock.ANY)])
+
+    def test__does_config_drive_failed(self, mock_execute):
+        mock_execute.side_effect = processutils.ProcessExecutionError('boom')
+        self.assertFalse(
+            partition_utils._does_config_drive_work(self.fake_dev)
+        )
+        mock_execute.assert_has_calls([
+            mock.call('mount', '-o', 'ro', '-t', 'auto', self.fake_dev,
+                      mock.ANY)])
+
+    @mock.patch.object(shutil, 'copytree', autospec=True)
+    @mock.patch.object(utils, 'mkfs', autospec=True)
+    def test__try_build_fat32_config_drive(self,
+                                           mock_mkfs,
+                                           mock_copy,
+                                           mock_execute):
+        partition_utils._try_build_fat32_config_drive(self.fake_dev,
+                                                      self.configdrive_file)
+        mock_execute.assert_has_calls([
+            mock.call('mount', '-o', 'loop,ro', '-t', 'auto',
+                      self.configdrive_file, mock.ANY),
+            mock.call('mount', '-t', 'auto', self.fake_dev, mock.ANY),
+            mock.call('umount', mock.ANY),
+            mock.call('umount', mock.ANY),
+        ])
+        mock_mkfs.assert_called_once_with(fs='vfat', path=self.fake_dev,
+                                          label='CONFIG-2')
+        # Validate we called copy as we expect, both source and destination
+        # are temporary folders.
+        mock_copy.assert_called_once_with(mock.ANY, mock.ANY,
+                                          dirs_exist_ok=True)
+
+    @mock.patch.object(shutil, 'copytree', autospec=True)
+    @mock.patch.object(utils, 'mkfs', autospec=True)
+    def test__try_build_fat32_config_drive_graceful_fail(
+            self,
+            mock_mkfs,
+            mock_copy,
+            mock_execute):
+        mock_execute.side_effect = processutils.ProcessExecutionError('boom')
+        self.assertIsNone(
+            partition_utils._try_build_fat32_config_drive(
+                self.fake_dev,
+                self.configdrive_file)
+        )
+        mock_execute.assert_called_once_with(
+            'mount', '-o', 'loop,ro', '-t', 'auto',
+            self.configdrive_file, mock.ANY)
+        mock_mkfs.assert_not_called()
+        # Validate we called copy as we expect, both source and destination
+        # are temporary folders.
+        mock_copy.assert_not_called()
+
+    @mock.patch.object(shutil, 'copytree', autospec=True)
+    @mock.patch.object(utils, 'mkfs', autospec=True)
+    def test__try_build_fat32_config_drive_fails_once_invalid(
+            self,
+            mock_mkfs,
+            mock_copy,
+            mock_execute):
+        mock_mkfs.side_effect = processutils.ProcessExecutionError('boom')
+        self.assertRaisesRegex(
+            errors.DeploymentError,
+            'A failure occurred while attempting to format.*',
+            partition_utils._try_build_fat32_config_drive,
+            self.fake_dev,
+            self.configdrive_file)
+        mock_execute.assert_has_calls([
+            mock.call('mount', '-o', 'loop,ro', '-t', 'auto',
+                      self.configdrive_file, mock.ANY),
+            mock.call('umount', mock.ANY),
+            mock.call('umount', mock.ANY),
+        ])
+
+        mock_mkfs.assert_called_once_with(fs='vfat', path=self.fake_dev,
+                                          label='CONFIG-2')
+        mock_copy.assert_not_called()
+
+
+class IsHttpUrlTestCase(base.IronicAgentTest):
+
+    def test__is_http_url(self):
+        self.assertTrue(partition_utils._is_http_url('http://127.0.0.1'))
+        self.assertTrue(partition_utils._is_http_url('https://127.0.0.1'))
+        self.assertTrue(partition_utils._is_http_url('HTTP://127.1.2.3'))
+        self.assertTrue(partition_utils._is_http_url('HTTPS://127.3.2.1'))
+        self.assertFalse(partition_utils._is_http_url('Zm9vYmFy'))
+        self.assertFalse(partition_utils._is_http_url('11111111'))

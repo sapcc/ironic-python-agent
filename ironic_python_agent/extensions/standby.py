@@ -12,19 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import errno
 import hashlib
+import json
 import os
+import re
 import tempfile
 import time
 from urllib import parse as urlparse
 
-from ironic_lib import disk_utils
-from ironic_lib import exception
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log
+from oslo_utils import units
 import requests
 
+from ironic_python_agent import disk_utils
 from ironic_python_agent import errors
 from ironic_python_agent.extensions import base
 from ironic_python_agent import hardware
@@ -46,6 +50,123 @@ def _image_location(image_info):
     return os.path.join(tempfile.gettempdir(), image_info['id'])
 
 
+def _verify_basic_auth_creds(user, password, image_id):
+    """Verify the basic auth credentials used for image download are present.
+
+    :param user: Basic auth username
+    :param password: Basic auth password
+    :param image_id: id of the image that is being acted upon
+
+    :raises ImageDownloadError if the credentials are not present
+    """
+    expected_creds = {'user': user, 'password': password}
+    missing_creds = []
+    for key, value in expected_creds.items():
+        if not value:
+            missing_creds.append(key)
+    if missing_creds:
+        raise errors.ImageDownloadError(
+            image_id,
+            "Missing {} fields from HTTP(S) "
+            "basic auth config".format(missing_creds)
+        )
+
+
+class SuppliedAuth(requests.auth.HTTPBasicAuth):
+
+    def __init__(self, authorization):
+        self.authorization = authorization
+
+    def __call__(self, r):
+        r.headers["Authorization"] = self.authorization
+        return r
+
+    def __eq__(self, other):
+        return all(
+            [
+                self.authorization == getattr(other, "authorization", None)
+            ]
+        )
+
+    def __ne__(self, other):
+        return not self == other
+
+
+def _load_supplied_authorization(image_info):
+
+    req_auth = image_info.get('image_request_authorization')
+    if req_auth:
+        req_auth = base64.standard_b64decode(req_auth).decode()
+        return SuppliedAuth(req_auth)
+    else:
+        return None
+
+
+def _gen_auth_from_image_info_user_pass(image_info, image_id):
+    """This function is used to pass the credentials to the chosen
+
+       credential verifier and in case the verification is successful
+       generate the compatible authentication object that will be used
+       with the request(s). This function handles the authentication object
+       generation for authentication strategies that are username+password
+       based. Credentials are collected via image_info.
+
+    :param image_info: Image information dictionary.
+    :param image_id: id of the image that is being acted upon
+
+    :return: Authentication object used directly by the request library
+    :rtype: requests.auth.HTTPBasicAuth
+    """
+    image_server_user = None
+    image_server_password = None
+
+    if image_info.get('image_server_auth_strategy') == 'http_basic':
+        image_server_user = image_info.get('image_server_user')
+        image_server_password = image_info.get('image_server_password')
+        _verify_basic_auth_creds(
+            image_server_user,
+            image_server_password,
+            image_id
+        )
+    else:
+        return None
+
+    return requests.auth.HTTPBasicAuth(image_server_user,
+                                       image_server_password)
+
+
+def _gen_auth_from_oslo_conf_user_pass(image_id):
+    """This function is used to pass the credentials to the chosen
+
+       credential verifier and in case the verification is successful
+       generate the compatible authentication object that will be used
+       with the request(s). This function handles the authentication object
+       generation for authentication strategies that are username+password
+       based. Credentials are collected from the oslo.config framework.
+
+    :param image_id: id of the image that is being acted upon
+
+    :return: Authentication object used directly by the request library
+    :rtype: requests.auth.HTTPBasicAuth
+    """
+
+    image_server_user = None
+    image_server_password = None
+
+    if CONF.image_server_auth_strategy == 'http_basic':
+        _verify_basic_auth_creds(
+            CONF.image_server_user,
+            CONF.image_server_password,
+            image_id)
+        image_server_user = CONF.image_server_user
+        image_server_password = CONF.image_server_password
+    else:
+        return None
+
+    return requests.auth.HTTPBasicAuth(image_server_user,
+                                       image_server_password)
+
+
 def _download_with_proxy(image_info, url, image_id):
     """Opens a download stream for the given URL.
 
@@ -55,13 +176,33 @@ def _download_with_proxy(image_info, url, image_id):
 
     :raises: ImageDownloadError if the download stream was not started
              properly.
+
+    :return: HTTP(s) server response for the image/hash download request
+    :rtype: requests.Response
     """
+
     no_proxy = image_info.get('no_proxy')
     if no_proxy:
         os.environ['no_proxy'] = no_proxy
     proxies = image_info.get('proxies', {})
     verify, cert = utils.get_ssl_client_options(CONF)
     resp = None
+    image_download_attributes = {
+        "stream": True,
+        "proxies": proxies,
+        "verify": verify,
+        "cert": cert,
+        "timeout": CONF.image_download_connection_timeout
+    }
+    # NOTE(Adam) `image_info` is prioritized over `oslo.conf` for credential
+    # collection and auth strategy selection
+    auth_object = _load_supplied_authorization(image_info)
+    if auth_object is None:
+        auth_object = _gen_auth_from_image_info_user_pass(image_info, image_id)
+    if auth_object is None:
+        auth_object = _gen_auth_from_oslo_conf_user_pass(image_id)
+    if auth_object is not None:
+        image_download_attributes['auth'] = auth_object
     for attempt in range(CONF.image_download_connection_retries + 1):
         try:
             # NOTE(TheJulia) The get request below does the following:
@@ -77,13 +218,12 @@ def _download_with_proxy(image_info, url, image_id):
             # exactly just as the timeout value exists. The risk in transitory
             # failure is more so once we've started the download and we are
             # processing the incoming data.
-            resp = requests.get(url, stream=True, proxies=proxies,
-                                verify=verify, cert=cert,
-                                timeout=CONF.image_download_connection_timeout)
+            # B113 issue is covered is the image_download_attributs list
+            resp = requests.get(url, **image_download_attributes)  # nosec
             if resp.status_code != 200:
                 msg = ('Received status code {} from {}, expected 200. '
-                       'Response body: {}').format(resp.status_code, url,
-                                                   resp.text)
+                       'Response body: {} Response headers: {}').format(
+                    resp.status_code, url, resp.text, resp.headers)
                 raise errors.ImageDownloadError(image_id, msg)
         except (errors.ImageDownloadError, requests.RequestException) as e:
             if (attempt == CONF.image_download_connection_retries
@@ -99,9 +239,35 @@ def _download_with_proxy(image_info, url, image_id):
     return resp
 
 
+def _is_checksum_url(checksum):
+    """Identify if checksum is not a url"""
+    if (checksum.startswith('http://') or checksum.startswith('https://')):
+        return True
+    else:
+        return False
+
+
+MD5_MATCH = r"^([a-fA-F\d]{32})\s"  # MD5 at beginning of line
+MD5_MATCH_END = r"\s([a-fA-F\d]{32})$"  # MD5 at end of line
+MD5_MATCH_ONLY = r"^([a-fA-F\d]{32})$"  # MD5 only
+SHA256_MATCH = r"^([a-fA-F\d]{64})\s"  # SHA256 at beginning of line
+SHA256_MATCH_END = r"\s([a-fA-F\d]{64})$"  # SHA256 at end of line
+SHA256_MATCH_ONLY = r"^([a-fA-F\d]{64})$"  # SHA256 only
+SHA512_MATCH = r"^([a-fA-F\d]{128})\s"  # SHA512 at beginning of line
+SHA512_MATCH_END = r"\s([a-fA-F\d]{128})$"  # SHA512 at end of line
+SHA512_MATCH_ONLY = r"^([a-fA-F\d]{128})$"  # SHA512 only
+FILENAME_MATCH_END = r"\s[*]?{filename}$"  # Filename binary/text end of line
+FILENAME_MATCH_PARENTHESES = r"\s\({filename}\)\s"  # CentOS images
+
+CHECKSUM_MATCHERS = (MD5_MATCH, MD5_MATCH_END, SHA256_MATCH, SHA256_MATCH_END,
+                     SHA512_MATCH, SHA512_MATCH_END)
+CHECKSUM_ONLY_MATCHERS = (MD5_MATCH_ONLY, SHA256_MATCH_ONLY, SHA512_MATCH_ONLY)
+FILENAME_MATCHERS = (FILENAME_MATCH_END, FILENAME_MATCH_PARENTHESES)
+
+
 def _fetch_checksum(checksum, image_info):
     """Fetch checksum from remote location, if needed."""
-    if not (checksum.startswith('http://') or checksum.startswith('https://')):
+    if not _is_checksum_url(checksum):
         # Not a remote checksum, return as it is.
         return checksum
 
@@ -113,23 +279,40 @@ def _fetch_checksum(checksum, image_info):
     elif len(lines) == 1:
         # Special case - checksums file with only the checksum itself
         if ' ' not in lines[0]:
-            return lines[0]
+            for matcher in CHECKSUM_ONLY_MATCHERS:
+                checksum = re.findall(matcher, lines[0])
+                if checksum:
+                    return checksum[0]
+            raise errors.ImageDownloadError(
+                checksum, ("Invalid checksum file (No valid checksum found) %s"
+                           % lines))
 
     # FIXME(dtantsur): can we assume the same name for all images?
     expected_fname = os.path.basename(urlparse.urlparse(
         image_info['urls'][0]).path)
     for line in lines:
-        checksum, fname = line.strip().split(None, 1)
-        # The star symbol designates binary mode, which is the same as text
-        # mode on GNU systems.
-        if fname.strip().lstrip('*') == expected_fname:
-            return checksum.strip()
+        # Ignore comment lines
+        if line.startswith("#"):
+            continue
+
+        # Ignore checksums for other files
+        for matcher in FILENAME_MATCHERS:
+            if re.findall(matcher.format(filename=expected_fname), line):
+                break
+        else:
+            continue
+
+        for matcher in CHECKSUM_MATCHERS:
+            checksum = re.findall(matcher, line)
+            if checksum:
+                return checksum[0]
 
     raise errors.ImageDownloadError(
         checksum, "Checksum file does not contain name %s" % expected_fname)
 
 
-def _write_partition_image(image, image_info, device, configdrive=None):
+def _write_partition_image(image, image_info, device, configdrive=None,
+                           source_format=None, is_raw=False, size=0):
     """Call disk_util to create partition and write the partition image.
 
     :param image: Local path to image file to be written to the partition.
@@ -140,6 +323,10 @@ def _write_partition_image(image, image_info, device, configdrive=None):
     :param configdrive: A string containing the location of the config
                         drive as a URL OR the contents (as gzip/base64)
                         of the configdrive. Optional, defaults to None.
+    :param source_format: The actual format of the partition image.
+                         Must be provided if deep image inspection is enabled.
+    :param is_raw: Ironic indicates the image is raw; do not convert it
+    :param size: Virtual size, in MB, of provided image.
 
     :raises: InvalidCommandParamsError if the partition is too small for the
              provided image.
@@ -159,10 +346,9 @@ def _write_partition_image(image, image_info, device, configdrive=None):
     cpu_arch = hardware.dispatch_to_managers('get_cpus').architecture
 
     if image is not None:
-        image_mb = disk_utils.get_image_mb(image)
-        if image_mb > int(root_mb):
+        if size > int(root_mb):
             msg = ('Root partition is too small for requested image. Image '
-                   'virtual size: {} MB, Root size: {} MB').format(image_mb,
+                   'virtual size: {} MB, Root size: {} MB').format(size,
                                                                    root_mb)
             raise errors.InvalidCommandParamsError(msg)
 
@@ -176,12 +362,15 @@ def _write_partition_image(image, image_info, device, configdrive=None):
                                             configdrive=configdrive,
                                             boot_mode=boot_mode,
                                             disk_label=disk_label,
-                                            cpu_arch=cpu_arch)
+                                            cpu_arch=cpu_arch,
+                                            source_format=source_format,
+                                            is_raw=is_raw)
     except processutils.ProcessExecutionError as e:
         raise errors.ImageWriteError(device, e.exit_code, e.stdout, e.stderr)
 
 
-def _write_whole_disk_image(image, image_info, device):
+def _write_whole_disk_image(image, image_info, device, source_format=None,
+                            is_raw=False):
     """Writes a whole disk image to the specified device.
 
     :param image: Local path to image file to be written to the disk.
@@ -189,25 +378,22 @@ def _write_whole_disk_image(image, image_info, device):
                        This parameter is currently unused by the function.
     :param device: The device name, as a string, on which to store the image.
                    Example: '/dev/sda'
-
+    :param source_format: The format of the whole disk image to be written.
+    :param is_raw: Ironic indicates the image is raw; do not convert it
     :raises: ImageWriteError if the command to write the image encounters an
              error.
+    :raises: InvalidImage if asked to write an image without a format when
+                          not permitted
     """
     # FIXME(dtantsur): pass the real node UUID for logging
     disk_utils.destroy_disk_metadata(device, '')
     disk_utils.udev_settle()
-
-    command = ['qemu-img', 'convert',
-               '-t', 'directsync', '-S', '0', '-O', 'host_device', '-W',
-               image, device]
-    LOG.info('Writing image with command: %s', ' '.join(command))
-    try:
-        disk_utils.convert_image(image, device, out_format='host_device',
-                                 cache='directsync', out_of_order=True,
-                                 sparse_size='0')
-    except processutils.ProcessExecutionError as e:
-        raise errors.ImageWriteError(device, e.exit_code, e.stdout, e.stderr)
-
+    disk_utils.populate_image(image, device,
+                              is_raw=is_raw,
+                              source_format=source_format,
+                              out_format='host_device',
+                              cache='directsync',
+                              out_of_order=True)
     disk_utils.trigger_device_rescan(device)
 
 
@@ -222,21 +408,35 @@ def _write_image(image_info, device, configdrive=None):
                         of the configdrive. Optional, defaults to None.
     :raises: ImageWriteError if the command to write the image encounters an
              error.
+    :raises: InvalidImage if the image does not pass security inspection
     """
     starttime = time.time()
     image = _image_location(image_info)
+    ironic_disk_format = image_info.get('disk_format')
+    is_raw = ironic_disk_format == 'raw'
+    # NOTE(JayF): The below method call performs a required security check
+    #             and must remain in place. See bug #2071740
+    source_format, size = disk_utils.get_and_validate_image_format(
+        image, ironic_disk_format)
+    size_mb = int((size + units.Mi - 1) / units.Mi)
+
     uuids = {}
     if image_info.get('image_type') == 'partition':
-        uuids = _write_partition_image(image, image_info, device, configdrive)
+        uuids = _write_partition_image(image, image_info, device,
+                                       configdrive,
+                                       source_format=source_format,
+                                       is_raw=is_raw, size=size_mb)
     else:
-        _write_whole_disk_image(image, image_info, device)
+        _write_whole_disk_image(image, image_info, device,
+                                source_format=source_format,
+                                is_raw=is_raw)
     totaltime = time.time() - starttime
     LOG.info('Image %(image)s written to device %(device)s in %(totaltime)s '
              'seconds', {'image': image, 'device': device,
                          'totaltime': totaltime})
     try:
         disk_utils.fix_gpt_partition(device, node_uuid=None)
-    except exception.InstanceDeployFailure:
+    except errors.DeploymentError:
         # Note: the catch internal to the helper method logs any errors.
         pass
     return uuids
@@ -263,6 +463,47 @@ def _message_format(msg, image_info, device, partition_uuids):
     return message
 
 
+def _get_algorithm_by_length(checksum):
+    """Determine the SHA-2 algorithm by checksum length.
+
+    :param checksum: The requested checksum.
+    :returns: A hashlib object based upon the checksum
+              or ValueError if the algorithm could not be
+              identified.
+    """
+    # NOTE(TheJulia): This is all based on SHA-2 lengths.
+    # SHA-3 would require a hint, thus ValueError because
+    # it may not be a fixed length. That said, SHA-2 is not
+    # as of this not being added, being withdrawn standards wise.
+    checksum_len = len(checksum)
+    if checksum_len == 128:
+        # Sha512 is 512 bits, or 128 characters
+        return hashlib.new('sha512')
+    elif checksum_len == 64:
+        # SHA256 is 256 bits, or 64 characters
+        return hashlib.new('sha256')
+    elif checksum_len == 32:
+        check_md5_enabled()
+        # This is not super great, but opt-in only.
+        return hashlib.new('md5')  # nosec
+    else:
+        # Previously, we would have just assumed the value was
+        # md5 by default. This way we are a little smarter and
+        # gracefully handle things better when md5 is explicitly
+        # disabled.
+        raise ValueError('Unable to identify checksum algorithm '
+                         'used, and a value is not specified in '
+                         'the os_hash_algo setting.')
+
+
+def check_md5_enabled():
+    """Checks if md5 is permitted, otherwise raises ValueError."""
+    if not CONF.md5_enabled:
+        raise ValueError('MD5 support is disabled, and support '
+                         'will be removed in a 2024 version of '
+                         'Ironic.')
+
+
 class ImageDownload(object):
     """Helper class that opens a HTTP connection to download an image.
 
@@ -274,7 +515,7 @@ class ImageDownload(object):
     def __init__(self, image_info, time_obj=None):
         """Initialize an instance of the ImageDownload class.
 
-        Trys each URL in image_info successively until a URL returns a
+        Tries each URL in image_info successively until a URL returns a
         successful request code. Once the object is initialized, the user may
         retrieve chunks of the image through the standard python iterator
         interface until either the image is fully downloaded, or an error is
@@ -292,6 +533,10 @@ class ImageDownload(object):
         self._time = time_obj or time.time()
         self._image_info = image_info
         self._request = None
+        self._bytes_transferred = 0
+        self._expected_size = None
+        checksum = image_info.get('checksum')
+        retrieved_checksum = False
 
         # Determine the hash algorithm and value will be used for calculation
         # and verification, fallback to md5 if algorithm is not set or not
@@ -300,18 +545,37 @@ class ImageDownload(object):
         if algo and algo in hashlib.algorithms_available:
             self._hash_algo = hashlib.new(algo)
             self._expected_hash_value = image_info.get('os_hash_value')
-        elif image_info.get('checksum'):
+        elif checksum and _is_checksum_url(checksum):
+            # Treat checksum urls as first class request citizens, else
+            # fallback to legacy handling.
+            self._expected_hash_value = _fetch_checksum(
+                checksum,
+                image_info)
+            retrieved_checksum = True
+            if not algo:
+                # Override algorithm not supplied as os_hash_algo
+                self._hash_algo = _get_algorithm_by_length(
+                    self._expected_hash_value)
+        elif checksum:
+            # Fallback to md5 path.
             try:
-                self._hash_algo = hashlib.md5()
+                new_algo = _get_algorithm_by_length(checksum)
+
+                if not new_algo:
+                    # Realistically, this should never happen, but for
+                    # compatibility...
+                    # TODO(TheJulia): Remove for a 2024 release.
+                    self._hash_algo = hashlib.new('md5')  # nosec
+                else:
+                    self._hash_algo = new_algo
             except ValueError as e:
-                message = ('Unable to proceed with image {} as the legacy '
-                           'checksum indicator has been used, which makes use '
-                           'the MD5 algorithm. This algorithm failed to load '
-                           'due to the underlying operating system. Error: '
+                message = ('Unable to proceed with image {} as the '
+                           'checksum indicator has been used but the '
+                           'algorithm could not be identified. Error: '
                            '{}').format(image_info['id'], str(e))
                 LOG.error(message)
                 raise errors.RESTError(details=message)
-            self._expected_hash_value = image_info['checksum']
+            self._expected_hash_value = checksum
         else:
             message = ('Unable to verify image {} with available checksums. '
                        'Please make sure the specified \'os_hash_algo\' '
@@ -322,8 +586,31 @@ class ImageDownload(object):
             LOG.error(message)
             raise errors.RESTError(details=message)
 
-        self._expected_hash_value = _fetch_checksum(self._expected_hash_value,
-                                                    image_info)
+        if not retrieved_checksum:
+            # Fallback to retrieve the checksum if we didn't retrieve it
+            # earlier on.
+            self._expected_hash_value = _fetch_checksum(
+                self._expected_hash_value,
+                image_info)
+
+        # NOTE(dtantsur): verify that the user's input does not obviously
+        # contradict the actual value. It is especially easy to make such
+        # a mistake when providing a checksum URL.
+        if algo:
+            try:
+                detected_algo = _get_algorithm_by_length(
+                    self._expected_hash_value)
+            except ValueError:
+                pass  # an exotic algorithm?
+            else:
+                if detected_algo.name != algo:
+                    LOG.warning("Provided checksum algorithm %(provided)s "
+                                "does not match the detected algorithm "
+                                "%(detected)s. It may be a sign of a user "
+                                "error when providing the algorithm or the "
+                                "checksum URL.",
+                                {'provided': algo,
+                                 'detected': detected_algo.name})
 
         details = []
         for url in image_info['urls']:
@@ -331,6 +618,8 @@ class ImageDownload(object):
                 LOG.info("Attempting to download image from %s", url)
                 self._request = _download_with_proxy(image_info, url,
                                                      image_info['id'])
+                self._expected_size = self._request.headers.get(
+                    'Content-Length')
             except errors.ImageDownloadError as e:
                 failtime = time.time() - self._time
                 log_msg = ('URL: {}; time: {} '
@@ -352,7 +641,21 @@ class ImageDownload(object):
                   which is a constant in this module.
         """
         self._last_chunk_time = None
+        start_time = self._time
+
         for chunk in self._request.iter_content(IMAGE_CHUNK_SIZE):
+
+            max_download_duration = CONF.image_download_max_duration
+            if max_download_duration:
+                elapsed = time.time() - start_time
+                if elapsed > max_download_duration:
+                    LOG.error('Total download timeout (%s seconds) exceeded',
+                              max_download_duration)
+                    raise errors.ImageDownloadTimeoutError(
+                        self._image_info['id'],
+                        'Download exceeded max allowed time (%s seconds)' %
+                        max_download_duration)
+
             # Per requests forum posts/discussions, iter_content should
             # periodically yield to the caller for the client to do things
             # like stopwatch and potentially interrupt the download.
@@ -363,7 +666,13 @@ class ImageDownload(object):
             # this code.
             if chunk:
                 self._last_chunk_time = time.time()
-                self._hash_algo.update(chunk)
+                if isinstance(chunk, str):
+                    encoded_data = chunk.encode()
+                    self._hash_algo.update(encoded_data)
+                    self._bytes_transferred += len(encoded_data)
+                else:
+                    self._hash_algo.update(chunk)
+                    self._bytes_transferred += len(chunk)
                 yield chunk
             elif (time.time() - self._last_chunk_time
                   > CONF.image_download_connection_timeout):
@@ -400,12 +709,26 @@ class ImageDownload(object):
                                             self._expected_hash_value,
                                             checksum)
 
+    @property
+    def bytes_transferred(self):
+        """Property value to return the number of bytes transferred."""
+        return self._bytes_transferred
+
+    @property
+    def content_length(self):
+        """Property value to return the server indicated length."""
+        # If none, there is nothing we can do, the server didn't have
+        # a response.
+        return self._expected_size
+
 
 def _download_image(image_info):
     """Downloads the specified image to the local file system.
 
     :param image_info: Image information dictionary.
     :raises: ImageDownloadError if the image download fails for any reason.
+    :raises: ImageDownloadOutofSpaceError if the image download fails
+             due to insufficient storage space.
     :raises: ImageChecksumError if the downloaded image's checksum does not
              match the one reported in image_info.
     """
@@ -418,12 +741,26 @@ def _download_image(image_info):
             with open(image_location, 'wb') as f:
                 try:
                     for chunk in image_download:
-                        f.write(chunk)
+                        try:
+                            f.write(chunk)
+                        except OSError as e:
+                            if e.errno == errno.ENOSPC:
+                                msg = ('Unable to write image to {}. Error: {}'
+                                       ).format(image_location, e)
+                                raise errors.ImageDownloadOutofSpaceError(
+                                    image_info['id'], msg)
+                            raise
+                except errors.ImageDownloadOutofSpaceError:
+                    raise
                 except Exception as e:
                     msg = 'Unable to write image to {}. Error: {}'.format(
                         image_location, str(e))
                     raise errors.ImageDownloadError(image_info['id'], msg)
-        except errors.ImageDownloadError as e:
+            image_download.verify_image(image_location)
+        except errors.ImageDownloadOutofSpaceError:
+            raise
+        except (errors.ImageDownloadError,
+                errors.ImageChecksumError) as e:
             if attempt == CONF.image_download_connection_retries:
                 raise
             else:
@@ -438,10 +775,12 @@ def _download_image(image_info):
 
     totaltime = time.time() - starttime
     LOG.info("Image downloaded from %(image_location)s "
-             "in %(totaltime)s seconds",
+             "in %(totaltime)s seconds. Transferred %(size)s bytes. "
+             "Server originally reported: %(reported)s.",
              {'image_location': image_location,
-              'totaltime': totaltime})
-    image_download.verify_image(image_location)
+              'totaltime': totaltime,
+              'size': image_download.bytes_transferred,
+              'reported': image_download.content_length})
 
 
 def _validate_image_info(ext, image_info=None, **kwargs):
@@ -458,6 +797,7 @@ def _validate_image_info(ext, image_info=None, **kwargs):
     """
     image_info = image_info or {}
 
+    checksum_avail = False
     md5sum_avail = False
     os_hash_checksum_avail = False
 
@@ -466,7 +806,7 @@ def _validate_image_info(ext, image_info=None, **kwargs):
             msg = 'Image is missing \'{}\' field.'.format(field)
             raise errors.InvalidCommandParamsError(msg)
 
-    if type(image_info['urls']) != list or not image_info['urls']:
+    if not isinstance(image_info['urls'], list) or not image_info['urls']:
         raise errors.InvalidCommandParamsError(
             'Image \'urls\' must be a list with at least one element.')
 
@@ -476,7 +816,13 @@ def _validate_image_info(ext, image_info=None, **kwargs):
                 or not image_info['checksum']):
             raise errors.InvalidCommandParamsError(
                 'Image \'checksum\' must be a non-empty string.')
-        md5sum_avail = True
+        if _is_checksum_url(checksum) or len(checksum) > 32:
+            # Checksum is a URL *or* a greater than 32 characters,
+            # putting it into the realm of sha256 or sha512 and not
+            # the MD5 algorithm.
+            checksum_avail = True
+        elif CONF.md5_enabled:
+            md5sum_avail = True
 
     os_hash_algo = image_info.get('os_hash_algo')
     os_hash_value = image_info.get('os_hash_value')
@@ -491,7 +837,7 @@ def _validate_image_info(ext, image_info=None, **kwargs):
                 'Image \'os_hash_value\' must be a non-empty string.')
         os_hash_checksum_avail = True
 
-    if not (md5sum_avail or os_hash_checksum_avail):
+    if not (checksum_avail or md5sum_avail or os_hash_checksum_avail):
         raise errors.InvalidCommandParamsError(
             'Image checksum is not available, either the \'checksum\' field '
             'or the \'os_hash_algo\' and \'os_hash_value\' fields pair must '
@@ -504,32 +850,23 @@ def _validate_partitioning(device):
     Check if after writing the image to disk we have a valid partition
     table by trying to read it. This will fail if the disk is junk.
     """
-    try:
-        # Ensure we re-read the partition table before we try to list
-        # partitions
-        utils.execute('partprobe', device, run_as_root=True,
-                      attempts=CONF.disk_utils.partprobe_attempts)
-    except (processutils.UnknownArgumentError,
-            processutils.ProcessExecutionError, OSError) as e:
-        LOG.warning("Unable to probe for partitions on device %(device)s "
-                    "after writing the image, the partitioning table may "
-                    "be broken. Error: %(error)s",
-                    {'device': device, 'error': e})
+    disk_utils.partprobe(device)
 
     try:
         nparts = len(disk_utils.list_partitions(device))
     except (processutils.UnknownArgumentError,
             processutils.ProcessExecutionError, OSError) as e:
         msg = ("Unable to find a valid partition table on the disk after "
-               f"writing the image. The image may be corrupted. Error: {e}")
-        raise exception.InstanceDeployFailure(msg)
+               "writing the image. The image may be corrupted or it uses a "
+               f"different sector size than the device. Error: {e}")
+        raise errors.DeploymentError(msg)
 
     # Check if there is at least one partition in the partition table after
     # deploy
     if not nparts:
         msg = ("No partitions found on the device {} after writing "
                "the image.".format(device))
-        raise exception.InstanceDeployFailure(msg)
+        raise errors.DeploymentError(msg)
 
 
 class StandbyExtension(base.BaseAgentExtension):
@@ -588,7 +925,12 @@ class StandbyExtension(base.BaseAgentExtension):
                         msg = ('Unable to write image to device {}. '
                                'Error: {}').format(device, str(e))
                         raise errors.ImageDownloadError(image_info['id'], msg)
-            except errors.ImageDownloadError as e:
+                # Verify the checksum of the streamed image is correct while
+                # still in the retry loop, so we can retry should a checksum
+                # failure be detected.
+                image_download.verify_image(device)
+            except (errors.ImageDownloadError,
+                    errors.ImageChecksumError) as e:
                 if attempt == CONF.image_download_connection_retries:
                     raise
                 else:
@@ -603,13 +945,15 @@ class StandbyExtension(base.BaseAgentExtension):
 
         totaltime = time.time() - starttime
         LOG.info("Image streamed onto device %(device)s in %(totaltime)s "
-                 "seconds", {'device': device, 'totaltime': totaltime})
-        # Verify if the checksum of the streamed image is correct
-        image_download.verify_image(device)
+                 "seconds for %(size)s bytes. Server originally reported "
+                 "%(reported)s.",
+                 {'device': device, 'totaltime': totaltime,
+                  'size': image_download.bytes_transferred,
+                  'reported': image_download.content_length})
         # Fix any gpt partition
         try:
             disk_utils.fix_gpt_partition(device, node_uuid=None)
-        except exception.InstanceDeployFailure:
+        except errors.DeploymentError:
             # Note: the catch internal to the helper method logs any errors.
             pass
         # Fix the root partition UUID
@@ -633,45 +977,6 @@ class StandbyExtension(base.BaseAgentExtension):
                         'The hexdump tool may be missing in IPA: %s', e)
         else:
             self.partition_uuids['root uuid'] = root_uuid
-
-    @base.async_command('cache_image', _validate_image_info)
-    def cache_image(self, image_info, force=False, configdrive=None):
-        """Asynchronously caches specified image to the local OS device.
-
-        :param image_info: Image information dictionary.
-        :param force: Optional. If True forces cache_image to download and
-                      cache image, even if the same image already exists on
-                      the local OS install device. Defaults to False.
-        :param configdrive: A string containing the location of the config
-                            drive as a URL OR the contents (as gzip/base64)
-                            of the configdrive. Optional, defaults to None.
-
-        :raises: ImageDownloadError if the image download fails for any reason.
-        :raises: ImageChecksumError if the downloaded image's checksum does not
-                  match the one reported in image_info.
-        :raises: ImageWriteError if writing the image fails.
-        """
-        LOG.debug('Caching image %s', image_info['id'])
-        device = hardware.dispatch_to_managers('get_os_install_device',
-                                               permit_refresh=True)
-
-        msg = 'image ({}) already present on device {} '
-
-        if self.cached_image_id != image_info['id'] or force:
-            LOG.debug('Already had %s cached, overwriting',
-                      self.cached_image_id)
-            # NOTE(dtantsur): backward compatibility
-            if configdrive is None:
-                configdrive = image_info.pop('configdrive', None)
-            self._cache_and_write_image(image_info, device, configdrive)
-            msg = 'image ({}) cached to device {} '
-
-        self._fix_up_partition_uuids(image_info, device)
-        result_msg = _message_format(msg, image_info, device,
-                                     self.partition_uuids)
-
-        LOG.info(result_msg)
-        return result_msg
 
     @base.async_command('prepare_image', _validate_image_info)
     def prepare_image(self, image_info, configdrive=None):
@@ -702,16 +1007,20 @@ class StandbyExtension(base.BaseAgentExtension):
         device = hardware.dispatch_to_managers('get_os_install_device',
                                                permit_refresh=True)
 
-        disk_format = image_info.get('disk_format')
+        requested_disk_format = image_info.get('disk_format')
+
         stream_raw_images = image_info.get('stream_raw_images', False)
+
         # don't write image again if already cached
         if self.cached_image_id != image_info['id']:
             if self.cached_image_id is not None:
                 LOG.debug('Already had %s cached, overwriting',
                           self.cached_image_id)
 
-            if stream_raw_images and disk_format == 'raw':
+            if stream_raw_images and requested_disk_format == 'raw':
                 if image_info.get('image_type') == 'partition':
+                    # NOTE(JayF): This only creates partitions due to image
+                    #             being None
                     self.partition_uuids = _write_partition_image(None,
                                                                   image_info,
                                                                   device,
@@ -721,6 +1030,9 @@ class StandbyExtension(base.BaseAgentExtension):
                     self.partition_uuids = {}
                     stream_to = device
 
+                # NOTE(JayF): Images that claim to be raw are not inspected at
+                #             all, as they never interact with qemu-img and are
+                #             streamed directly to disk unmodified.
                 self._stream_raw_image_onto_device(image_info, stream_to)
             else:
                 self._cache_and_write_image(image_info, device, configdrive)
@@ -768,8 +1080,8 @@ class StandbyExtension(base.BaseAgentExtension):
                     'but received "%s".') % command)
             raise errors.InvalidCommandParamsError(msg)
         try:
-            self.sync()
-        except errors.CommandExecutionError as e:
+            hardware.dispatch_to_all_managers('full_sync')
+        except Exception as e:
             LOG.warning('Failed to sync file system buffers: % s', e)
 
         try:
@@ -810,13 +1122,7 @@ class StandbyExtension(base.BaseAgentExtension):
 
         :raises: CommandExecutionError if flushing file system buffers fails.
         """
-        LOG.debug('Flushing file system buffers')
-        try:
-            utils.execute('sync')
-        except processutils.ProcessExecutionError as e:
-            error_msg = 'Flushing file system buffers failed. Error: %s' % e
-            LOG.error(error_msg)
-            raise errors.CommandExecutionError(error_msg)
+        hardware.dispatch_to_all_managers('full_sync')
 
     @base.sync_command('get_partition_uuids')
     def get_partition_uuids(self):
@@ -852,3 +1158,240 @@ class StandbyExtension(base.BaseAgentExtension):
             LOG.error(msg)
             if CONF.fail_if_clock_not_set or not ignore_errors:
                 raise errors.ClockSyncError(msg)
+
+    @base.async_command('execute_bootc_install')
+    def execute_bootc_install(self, image_source, instance_info={},
+                              pull_secret=None, configdrive=None):
+        """Asynchronously prepares specified image on local OS install device.
+
+        Identifies target disk device to deploy onto, and extracts necessary
+        configuration data to trigger podman, triggers podman, verifies
+        partitioning changes were made, and finally executes configuration
+        drive write-out.
+
+        :param image_source: The OCI Container registry URL supplied by Ironic.
+        :param instance_info: An Ironic Node's instance_info filed for user
+            requested specific configuration details be extracted.
+        :param pull_secret: The user requested or system required pull secret
+            to authenticate to remote container image registries.
+        :param configdrive: The user requested configuration drive content
+            supplied by Ironic's step execution command.
+
+        :raises: ImageDownloadError if the image download encounters an error.
+        :raises: ImageChecksumError if the checksum of the local image does not
+             match the checksum as reported by glance in image_info.
+        :raises: ImageWriteError if writing the image fails.
+        :raises: InstanceDeployFailure if failed to create config drive.
+             large to store on the given device.
+        """
+        LOG.debug('Preparing container %s for bootc.', image_source)
+        if CONF.disable_bootc_deploy:
+            LOG.error('A bootc based deployment was requested for %s, '
+                      'however bootc based deployment is disabled.',
+                      image_source)
+            raise errors.CommandExecutionError(
+                details=("The bootc deploy interface is administratively "
+                         "disable. Deployment cannot proceed."))
+        device = hardware.dispatch_to_managers('get_os_install_device',
+                                               permit_refresh=True)
+        authorized_keys = instance_info.get('bootc_authorized_keys', None)
+        tpm2_luks = instance_info.get('bootc_tpm2_luks', False)
+        self._download_container_and_bootc_install(image_source, device,
+                                                   pull_secret, tpm2_luks,
+                                                   authorized_keys)
+
+        _validate_partitioning(device)
+
+        # For partition images the configdrive creation is taken care by
+        # partition_utils.work_on_disk(), invoked from either
+        # _write_partition_image or _cache_and_write_image above.
+        # Handle whole disk images explicitly now.
+        if configdrive:
+            partition_utils.create_config_drive_partition('local',
+                                                          device,
+                                                          configdrive)
+
+        msg = f'Container image ({image_source}) written to device {device}'
+        LOG.info(msg)
+        return msg
+
+    def _download_container_and_bootc_install(self, image_source,
+                                              device, pull_secret,
+                                              tpm2_luks, authorized_keys):
+        """Downloads container and triggers bootc install.
+
+        :param image_source: The user requested image_source to
+            deploy to the hard disk.
+        :param device: The device to deploy to.
+        :param pull_secret: A pull secret to interact with a remote
+            container image registry.
+        :param tpm2_luks: Boolean value if LUKS should be requested.
+        :param authorized_keys: The authorized keys string data
+            to supply to podman, if applicable.
+        :raises: ImageDownloadError If the downloaded container
+                 lacks the ``bootc`` command.
+        :raises: ImageWriteError If the execution of podman fails.
+        """
+        # First, disable pivot_root in podman because it cannot be
+        # performed on top of a ramdisk filesystem.
+        self._write_no_pivot_root()
+
+        # Identify the URL, specifically so we drop
+        url = urlparse.urlparse(image_source)
+
+        # This works because the path is maintained.
+        container_url = url.netloc + url.path
+
+        if pull_secret:
+            self._write_container_auth(pull_secret, url.netloc)
+
+        # Get the disk size, and convert it to megabtyes.
+        disk_size = disk_utils.get_dev_byte_size(device) // 1024 // 1024
+
+        # Ensure we leave enough space for a configuration drive,
+        # and ESP partition.
+        # NOTE(TheJulia): bootc leans towards a 512 MB EFI partition.
+        disk_size = disk_size - 768
+        # Convert from a float to string.
+        disk_size = str(disk_size)
+
+        # Determine the status of selinux.
+        selinux = False
+        try:
+            stdout, _ = utils.execute("getenforce", use_standard_locale=True)
+            if stdout.startswith('Enforcing'):
+                selinux = True
+        except (processutils.ProcessExecutionError,
+                errors.CommandExecutionError,
+                OSError):
+            pass
+
+        # Execute Podman to run bootc from the container.
+        #
+        # This has to run as a privileged operation, mapping the container
+        # assets from the runtime to inside of the container environment,
+        # and pass the device through.
+        #
+        # As for bootc itself...
+        # --skip-fetch-check disables an internal check to bootc to make sure
+        # it can retrieve updates from the remote registry, which is fine if
+        # credentials are already in the container or we embed the credentials,
+        # but that is not the best idea.
+        # --disable-selinux is alternatively needed if selinux is *not*
+        # enabled on the host.
+        command = [
+            'podman',
+            '--log-level=debug',
+            'run', '--rm', '--privileged', '--pid=host',
+            '-v', '/var/lib/containers:/var/lib/containers',
+            '-v', '/dev:/dev',
+            # By default, podman's retry starts at 3s and extends
+            # expentionally, which can lead to podman appearing
+            # to hang when downloading. This pins it so it just
+            # retires in relatively short order.
+            '--retry-delay=5s',
+        ]
+        if pull_secret:
+            command.append('--authfile=/root/.config/containers/auth.json')
+        if authorized_keys:
+            # NOTE(TheJulia): Bandit flags on this, but we need a folder which
+            # should exist in the container *and* locally to the ramdisk.
+            # As such, flagging with nosec.
+            command.extend(['-v', '/tmp:/tmp'])  # nosec B108
+        if selinux:
+            command.extend([
+                '--security-opt', 'label=type:unconfined_t'
+            ])
+        command.extend([
+            container_url,
+            'bootc', 'install', 'to-disk',
+            '--wipe', '--skip-fetch-check',
+            '--root-size=' + disk_size + 'M'
+        ])
+        if tpm2_luks:
+            command.append('--block-setup=tpm2-luks')
+        if authorized_keys:
+            key_file = self._write_authorized_keys(authorized_keys)
+            command.append(f'--root-ssh-authorized-keys={key_file}')
+
+        if not selinux:
+            # For SELinux to be applied, per the bootc docs, you must have
+            # SELinux enabled on the host system.
+            command.append('--disable-selinux')
+
+        command.append(device)
+
+        try:
+            stdout, stderr = utils.execute(*command, use_standard_locale=True)
+        except processutils.ProcessExecutionError as e:
+            LOG.debug('Failed to execute podman: %s', e)
+            raise errors.ImageWriteError(device, e.exit_code, e.stdout,
+                                         e.stderr)
+        for output in [stdout, stderr]:
+            if 'executable file `bootc` not found' in output:
+                # This is the case where the container doesn't actually
+                # support bootc, because it lacks the bootc tool.
+                # This should be stderr, but appears in stdout. Check both
+                # just on the safe side.
+                raise errors.ImageDownloadError(
+                    image_source,
+                    "Container does not contain the required bootc binary "
+                    "and thus cannot be deployed."
+                )
+
+    def _write_no_pivot_root(self):
+        """Writes a podman no-pivot configuration."""
+        # This method writes a configuration to tell podman
+        # to *don't* attempt to pivot_root on the ramdisk, because
+        # it won't work. In essence, just setting the environment,
+        # to actually execute a container.
+        path = '/etc/containers/containers.conf.d'
+        os.makedirs(path, exist_ok=True)
+        file_path = os.path.join(path, '01-ipa.conf')
+        file_content = '[engine]\nno_pivot_root = true\n'
+        with open(file_path, 'w') as file:
+            file.write(file_content)
+
+    def _write_container_auth(self, pull_secret, netloc):
+        """Write authentication configuration for container registry auth.
+
+        :param pull_secret: The authorization pull secret string for
+                            interacting with a remote container registry.
+        :param netloc: The FQDN, or network location portion of the URL
+                       used to access the container registry.
+        """
+        # extract secret
+        decoded_pull_secret = base64.standard_b64decode(
+            pull_secret
+        ).decode()
+
+        # Generate a dict which will emulate our container auth
+        # configuration.
+        auth_dict = {
+            "auths": {netloc: {"auth": decoded_pull_secret}}}
+
+        # Make the folders to $HOME/.config/containers/auth.json
+        # which would normally be generated by podman login, but
+        # we don't need to actually do that as we have a secret.
+        # Default to root, as we don't launch IPA with a HOME
+        # folder in most cases.
+        home = '/root'
+        folder = os.path.join(home, '.config/containers')
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        auth_path = os.path.join(folder, 'auth.json')
+
+        # Save the pull secret
+        with open(auth_path, 'w') as file:
+            json.dump(auth_dict, file)
+
+    def _write_authorized_keys(self, authorized_keys):
+        """Write a temporary authorized keys file for bootc use."""
+        # Write authorized_keys content to a temporary file
+        # on the temporary folder path structure which can be
+        # accessed by podman. On linux in our ramdisks, this
+        # should always be /tmp. We then return the absolute
+        # file path for podman to leverage.
+        fd, file_path = tempfile.mkstemp(text=True)
+        os.write(fd, authorized_keys.encode())
+        os.close(fd)
+        return file_path

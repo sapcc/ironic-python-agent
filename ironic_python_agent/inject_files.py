@@ -16,12 +16,11 @@ import base64
 import contextlib
 import os
 
-from ironic_lib import disk_utils
-from ironic_lib import utils as ironic_utils
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log
 
+from ironic_python_agent import disk_utils
 from ironic_python_agent import errors
 from ironic_python_agent import hardware
 from ironic_python_agent import utils
@@ -89,7 +88,7 @@ def _inject_one(node, ports, fl, root_dev, http_get):
     with _find_and_mount_path(fl['path'], fl.get('partition'),
                               root_dev) as path:
         if fl.get('deleted'):
-            ironic_utils.unlink_without_raise(path)
+            utils.unlink_without_raise(path)
             return
 
         try:
@@ -144,7 +143,7 @@ def _find_and_mount_path(path, partition, root_dev):
         try:
             part_num = int(partition)
         except ValueError:
-            with ironic_utils.mounted(partition) as part_path:
+            with utils.mounted(partition) as part_path:
                 yield os.path.join(part_path, path)
         else:
             # TODO(dtantsur): switch to ironic-lib instead:
@@ -154,7 +153,7 @@ def _find_and_mount_path(path, partition, root_dev):
                 part_template = '%sp%s'
             part_dev = part_template % (root_dev, part_num)
 
-            with ironic_utils.mounted(part_dev) as part_path:
+            with utils.mounted(part_dev) as part_path:
                 yield os.path.join(part_path, path)
     else:
         try:
@@ -199,7 +198,7 @@ def find_partition_with_path(path, device=None):
 
         LOG.debug('Inspecting partition %s for path %s', part, path)
         try:
-            with ironic_utils.mounted(part_path) as local_path:
+            with utils.mounted(part_path) as local_path:
                 found_path = os.path.join(local_path, lookup_path)
                 if not os.path.isdir(found_path):
                     continue

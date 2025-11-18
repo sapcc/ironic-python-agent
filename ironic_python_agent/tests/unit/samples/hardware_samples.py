@@ -102,35 +102,48 @@ BLK_DEVICE_TEMPLATE = """
     "blockdevices": [
         {"kname":"sda", "model":"TinyUSB Drive", "size":3116853504,
         "rota":false, "type":"disk", "serial":"sda123", "uuid":"F531-BDC3",
-        "partuuid":null},
+        "partuuid":null, "wwn":"wwn0", "log-sec": 512, "phy-sec": 512,
+        "tran": "sas"},
         {"kname":"sdb", "model":"Fastable SD131 7", "size":10737418240,
-        "rota":false, "type":"disk", "serial":"sdb123",
-        "uuid":"9a5e5cca-e03d-4cbd-9054-9e6ca9048222", "partuuid":null},
+        "rota":false, "type":"disk", "serial":"sdb123", "wwn":"wwn1",
+        "uuid":"9a5e5cca-e03d-4cbd-9054-9e6ca9048222", "partuuid":null,
+        "log-sec": 512, "phy-sec": 512, "tran": "sas"},
         {"kname":"sdc", "model":"NWD-BLP4-1600", "size":1765517033472,
         "rota":false, "type":"disk", "serial":"sdc123", "uuid":null,
-        "partuuid":null},
+        "partuuid":null, "wwn":"wwn2", "log-sec": 512, "phy-sec": 512,
+        "tran": "sas"},
         {"kname":"sdd", "model":"NWD-BLP4-1600", "size":1765517033472,
         "rota":false, "type":"disk", "serial":"sdd123", "uuid":null,
-        "partuuid":null},
+        "partuuid":null, "wwn":"wwn3", "log-sec": 512, "phy-sec": 512,
+        "tran": "sas"},
         {"kname":"loop0", "model":null, "size":109109248, "rota":true,
-        "type":"loop", "serial":null, "uuid":null, "partuuid": null},
+        "type":"loop", "serial":null, "uuid":null, "partuuid": null,
+        "wwn":"wwn03", "log-sec": 512, "phy-sec": 512, "tran": null},
         {"kname":"zram0", "model":null, "size":0, "rota":false, "type":"disk",
-        "serial":null, "uuid":null, "partuuid":null},
+        "serial":null, "uuid":null, "partuuid":null, "wwn":"wwn04",
+        "log-sec": 512, "phy-sec": 512, "tran": null},
         {"kname":"ram0", "model":null, "size":8388608, "rota":false,
-        "type":"disk", "serial":null, "uuid":null, "partuuid":null},
+        "type":"disk", "serial":null, "uuid":null, "partuuid":null, "wwn":null,
+        "log-sec": 512, "phy-sec": 512, "tran": null},
         {"kname":"ram1", "model":null, "size":8388608, "rota":false,
-        "type":"disk", "serial":null, "uuid":null, "partuuid":null},
+        "type":"disk", "serial":null, "uuid":null, "partuuid":null, "wwn":null,
+        "log-sec": 512, "phy-sec": 512, "tran": null},
         {"kname":"ram2", "model":null, "size":8388608, "rota":false,
-        "type":"disk", "serial":null,  "uuid":null, "partuuid":null},
+        "type":"disk", "serial":null,  "uuid":null, "partuuid":null,"wwn":null,
+        "log-sec": 512, "phy-sec": 512, "tran": null},
         {"kname":"ram3", "model":null, "size":8388608, "rota":false,
-        "type":"disk", "serial":null, "uuid":null, "partuuid":null},
+        "type":"disk", "serial":null, "uuid":null, "partuuid":null, "wwn":null,
+        "log-sec": 512, "phy-sec": 512, "tran": null},
         {"kname":"fd1", "model":"magic", "size":4096, "rota":true,
-        "type":"disk", "serial":null, "uuid":null, "partuuid":null},
+        "type":"disk", "serial":null, "uuid":null, "partuuid":null, "wwn":null,
+        "log-sec": 512, "phy-sec": 512, "tran": null},
         {"kname":"sdf", "model":"virtual floppy", "size":0, "rota":true,
-        "type":"disk", "serial":null, "uuid":null, "partuuid":null},
+        "type":"disk", "serial":null, "uuid":null, "partuuid":null, "wwn":null,
+        "log-sec": 512, "phy-sec": 512, "tran": "sas"},
         {"kname":"dm-0", "model":"NWD-BLP4-1600", "size":"1765517033472",
         "rota":false, "type":"mpath", "serial":null, "uuid":null,
-        "partuuid":null}
+        "partuuid":null, "wwn":null , "log-sec": 512, "phy-sec": 512,
+        "tran": "sas"}
     ]
 }
 """
@@ -140,9 +153,11 @@ BLK_DEVICE_TEMPLATE_SMALL = """
 {
   "blockdevices": [
     {"kname":"sda", "model":"TinyUSB Drive", "size":3116853504, "rota":false,
-    "type":"disk", "serial":"123", "uuid":"F531-BDC", "partuuid":null},
+    "type":"disk", "serial":"123", "uuid":"F531-BDC", "partuuid":null,
+    "wwn":"wwn0", "log-sec": 512, "phy-sec": 512, "tran": "sas"},
     {"kname":"sdb", "model":"AlmostBigEnough Drive", "size":"4294967295",
-    "rota":false, "type":"disk", "serial":"456", "uuid":null, "partuuid":null}
+    "rota":false, "type":"disk", "serial":"456", "uuid":null, "partuuid":null,
+    "wwn":"wwn1", "log-sec": 512, "phy-sec": 512, "tran": "sas"}
   ]
 }
 """
@@ -153,9 +168,11 @@ BLK_INCOMPLETE_DEVICE_TEMPLATE_SMALL = """
 {
   "blockdevices": [
     {"kname":"sda", "model":"TinyUSB Drive", "size":3116853504, "rota":false,
-    "type":"disk", "serial":"", "uuid":"F531-BDC", "partuuid":null},
+    "type":"disk", "serial":"", "uuid":"F531-BDC", "partuuid":null, "wwn":"",
+    "log-sec": 512, "phy-sec": 512, "tran": "sas"},
     {"kname":"sdb", "model":"AlmostBigEnough Drive", "size":"4294967295",
-    "rota":false, "type":"disk", "serial":"", "uuid":null, "partuuid":null}
+    "rota":false, "type":"disk", "serial":"", "uuid":null, "partuuid":null,
+    "wwn":null , "log-sec": 512, "phy-sec": 512, "tran": "sas"}
   ]
 }
 """
@@ -165,29 +182,38 @@ BLK_INCOMPLETE_DEVICE_TEMPLATE_SMALL = """
 # NOTE(dszumski): We include some partitions here to verify that
 # they are filtered out when not requested. It is assumed that
 # ROTA has been set to 0 on some software RAID devices for testing
-# purposes. In practice is appears to inherit from the underyling
+# purposes. In practice is appears to inherit from the underlying
 # devices, so in this example it would normally be 1.
 RAID_BLK_DEVICE_TEMPLATE = ("""
 {
     "blockdevices": [
       {"kname":"sda", "model":"DRIVE 0", "size":1765517033472, "rota":true,
-      "type":"disk", "serial":"sda123", "uuid":null, "partuuid":null},
+      "type":"disk", "serial":"sda123", "uuid":null, "partuuid":null,
+      "wwn":"wwn1234" , "log-sec": 512, "phy-sec": 512, "tran": "sas"},
       {"kname":"sda1", "model":"DRIVE 0", "size":107373133824, "rota":true,
-      "type":"part", "serial":"sda1123", "uuid":null, "partuuid":null},
+      "type":"part", "serial":"sda1123", "uuid":null, "partuuid":null,
+      "wwn":"wwn2222", "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"sdb", "model":"DRIVE 1", "size":1765517033472, "rota":true,
-      "type":"disk", "serial":"sdb123", "uuid":null, "partuuid":null},
+      "type":"disk", "serial":"sdb123", "uuid":null, "partuuid":null,
+      "wwn":"wwn333", "log-sec": 512, "phy-sec": 512, "tran": "sas"},
       {"kname":"sdb", "model":"DRIVE 1", "size":1765517033472, "rota":true,
-      "type":"disk", "uuid":null, "partuuid":null},
+      "type":"disk", "uuid":null, "partuuid":null, "wwn":"444", "log-sec": 512,
+      "phy-sec": 512, "tran": "sas"},
       {"kname":"sdb1", "model":"DRIVE 1", "size":107373133824, "rota":true,
-      "type":"part", "serial":"sdb1123", "uuid":null, "partuuid":null},
+      "type":"part", "serial":"sdb1123", "uuid":null, "partuuid":null,
+      "wwn":"wwn5", "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"md0p1", "model":"RAID", "size":107236818944, "rota":false,
-      "type":"md", "serial":null, "uuid":null, "partuuid":null},
+      "type":"md", "serial":null, "uuid":null, "partuuid":null, "wwn":"wwn6",
+      "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"md0", "model":"RAID", "size":1765517033470, "rota":false,
-      "type":"raid1", "serial":null, "uuid":null, "partuuid":null},
+      "type":"raid1", "serial":null, "uuid":null, "partuuid":null, "wwn":"12",
+      "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"md0", "model":"RAID", "size":1765517033470, "rota":false,
-      "type":"raid1", "serial":null, "uuid":null, "partuuid":null},
+      "type":"raid1", "serial":null, "uuid":null, "partuuid":null, "wwn":"33",
+      "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"md1", "model":"RAID", "size":0, "rota":false, "type":"raid1",
-      "serial":null, "uuid":null, "partuuid":null}
+      "serial":null, "uuid":null, "partuuid":null, "wwn":null, "log-sec": 512,
+      "phy-sec": 512, "tran": null}
     ]
 }
 """)
@@ -197,51 +223,65 @@ MULTIPATH_BLK_DEVICE_TEMPLATE = ("""
     "blockdevices": [
       {"kname":"sda", "model":"INTEL_SSDSC2CT060A3", "size":"60022480896",
       "rota":false, "type":"disk", "serial":"sda123", "uuid":null,
-      "partuuid":null},
+      "partuuid":null, "wwn":null , "log-sec": 512, "phy-sec": 512,
+      "tran": "sas"},
       {"kname":"sda2", "model":null, "size":"59162722304", "rota":false,
       "type":"part", "uuid":"f8b55d59-96c3-3982-b129-1b6b2ee8da86",
-      "partuuid":"c97c8aac-7796-4433-b1fc-9b5fac43edf3", "serial":"sda2123"},
+      "partuuid":"c97c8aac-7796-4433-b1fc-9b5fac43edf3", "serial":"sda2123",
+      "wwn":"" , "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"sda3", "model":null, "size":"650002432", "rota":false,
       "type":"part", "uuid":"b3b03565-5f13-3c93-b2a6-6d90e25be926",
-      "partuuid":"6c85beff-b2bd-4a1c-91b7-8abb5256459d", "serial":"sda3123"},
+      "partuuid":"6c85beff-b2bd-4a1c-91b7-8abb5256459d", "serial":"sda3123",
+      "wwn":"wwn1" , "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"sda1", "model":null, "size":"209715200", "rota":false,
       "type":"part", "uuid":"0a83355d-7500-3f5f-9abd-66f6fd03714c",
-      "partuuid":"eba28b26-b76a-402c-94dd-0b66a523a485", "serial":"sda1123"},
+      "partuuid":"eba28b26-b76a-402c-94dd-0b66a523a485", "serial":"sda1123",
+      "wwn":"123" , "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"dm-0", "model":null, "size":"60022480896", "rota":false,
-      "type":"mpath", "serial":null, "uuid":null, "partuuid":null},
+      "type":"mpath", "serial":null, "uuid":null, "partuuid":null,
+      "wwn":"123aa" , "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"dm-4", "model":null, "size":"650002432", "rota":false,
       "type":"part", "uuid":"b3b03565-5f13-3c93-b2a6-6d90e25be926",
-      "partuuid":"6c85beff-b2bd-4a1c-91b7-8abb5256459d", "serial":null},
+      "partuuid":"6c85beff-b2bd-4a1c-91b7-8abb5256459d", "serial":null,
+      "wwn":"123bb" , "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"dm-2", "model":null, "size":"209715200", "rota":false,
       "type":"part", "uuid":"0a83355d-7500-3f5f-9abd-66f6fd03714c",
-      "partuuid":"eba28b26-b76a-402c-94dd-0b66a523a485", "serial":null},
+      "partuuid":"eba28b26-b76a-402c-94dd-0b66a523a485", "serial":null,
+      "wwn":"123cc" , "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"dm-3", "model":null, "size":"59162722304", "rota":false,
       "type":"part", "uuid":"f8b55d59-96c3-3982-b129-1b6b2ee8da86",
-      "partuuid":"c97c8aac-7796-4433-b1fc-9b5fac43edf3", "serial":null},
+      "partuuid":"c97c8aac-7796-4433-b1fc-9b5fac43edf3", "serial":null,
+      "wwn":"123dd" , "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"sdb", "model":"INTEL_SSDSC2CT060A3", "size":"60022480896",
       "rota":false, "type":"disk", "serial":"sdb123", "uuid":null,
-      "partuuid":null},
+      "partuuid":null, "wwn":"123ee" , "log-sec": 512, "phy-sec": 512,
+      "tran": "sas"},
       {"kname":"sdb2", "model":null, "size":"59162722304",
       "rota":false, "type":"part", "serial":"sdb2123",
-      "uuid":"f8b55d59-96c3-3982-b129-1b6b2ee8da86",
-      "partuuid":"c97c8aac-7796-4433-b1fc-9b5fac43edf3"},
+      "uuid":"f8b55d59-96c3-3982-b129-1b6b2ee8da86", "wwn":"123gg",
+      "partuuid":"c97c8aac-7796-4433-b1fc-9b5fac43edf3", "log-sec": 512,
+      "phy-sec": 512, "tran": null},
       {"kname":"sdb3", "model":null, "size":"650002432",
       "rota":false, "type":"part", "serial":"sdv3123",
-      "uuid":"b3b03565-5f13-3c93-b2a6-6d90e25be926",
-      "partuuid":"6c85beff-b2bd-4a1c-91b7-8abb5256459d"},
+      "uuid":"b3b03565-5f13-3c93-b2a6-6d90e25be926", "wwn":"123zz",
+      "partuuid":"6c85beff-b2bd-4a1c-91b7-8abb5256459d", "log-sec": 512,
+      "phy-sec": 512, "tran": null},
       {"kname":"sdb1", "model":null, "size":"209715200",
       "rota":false, "type":"part", "serial":"sdb1123",
-      "uuid":"0a83355d-7500-3f5f-9abd-66f6fd03714c",
-      "partuuid":"eba28b26-b76a-402c-94dd-0b66a523a485"},
+      "uuid":"0a83355d-7500-3f5f-9abd-66f6fd03714c", "wwn":"123ll",
+      "partuuid":"eba28b26-b76a-402c-94dd-0b66a523a485", "log-sec": 512,
+      "phy-sec": 512, "tran": null},
       {"kname":"sdc", "model":"ST1000DM003-1CH162", "size":"1000204886016",
-      "rota":true, "type":"disk", "serial":"sdc123", "uuid":null,
-      "partuuid":null},
+      "rota":true, "type":"disk", "serial":"sdc123", "uuid":null, "wwn":"123g",
+      "partuuid":null, "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"sdc1", "model":null, "size":"899999072256",
       "rota":true, "type":"part", "serial":"sdc1123",
-      "uuid":"457f7d3c-9376-4997-89bd-d1a7c8b04060",
-      "partuuid":"c9433d2e-3bbc-47b4-92bf-43c1d80f06e0"},
+      "uuid":"457f7d3c-9376-4997-89bd-d1a7c8b04060", "wwn":"123kc",
+      "partuuid":"c9433d2e-3bbc-47b4-92bf-43c1d80f06e0", "log-sec": 512,
+      "phy-sec": 512, "tran": null},
       {"kname":"dm-1", "model":null, "size":"1000204886016", "rota":false,
-      "type":"mpath", "serial":null, "uuid":null, "partuuid":null}
+      "type":"mpath", "serial":null, "uuid":null, "partuuid":null,
+      "wwn":"sp0ng3b0b" , "log-sec": 512, "phy-sec": 512, "tran": null}
     ]
 }
 """)
@@ -250,10 +290,11 @@ PARTUUID_DEVICE_TEMPLATE = ("""
 {
     "blockdevices": [
       {"kname":"sda", "model":"DRIVE 0", "size":1765517033472, "rota":true,
-      "type":"disk", "serial":"sda123", "uuid":null, "partuuid":null},
+      "type":"disk", "serial":"sda123", "uuid":null, "partuuid":null,
+      "wwn":"4d4m", "log-sec": 512, "phy-sec": 512, "tran": null},
       {"kname":"sda1", "model":"DRIVE 0", "size":107373133824, "rota":true,
-      "type":"part", "serial":"sda1123", "uuid":"987654-3210",
-      "partuuid":"1234-5678"}
+      "type":"part", "serial":"sda1123", "uuid":"987654-3210", "wwn":"k4k1",
+      "partuuid":"1234-5678", "log-sec": 512, "phy-sec": 512, "tran": null}
     ]
 }
 """)
@@ -287,6 +328,43 @@ SHRED_OUTPUT_2_ITERATIONS_ZERO_FALSE = (
 )
 
 LSCPU_OUTPUT = """
+Architecture:                       x86_64
+CPU op-mode(s):                     32-bit, 64-bit
+Byte Order:                         Little Endian
+Address sizes:                      48 bits physical, 48 bits virtual
+CPU(s):                             8
+On-line CPU(s) list:                0-7
+Thread(s) per core:                 1
+Core(s) per socket:                 8
+Socket(s):                          1
+NUMA node(s):                       1
+Vendor ID:                          AuthenticAMD
+CPU family:                         23
+Model:                              49
+Model name:                         AMD EPYC 7282 16-Core Processor
+Stepping:                           0
+CPU MHz:                            2794.748
+BogoMIPS:                           5589.49
+Hypervisor vendor:                  KVM
+Virtualization type:                full
+L1d cache:                          512 KiB
+L1i cache:                          512 KiB
+L2 cache:                           4 MiB
+L3 cache:                           16 MiB
+NUMA node0 CPU(s):                  0-7
+Vulnerability Gather data sampling: Not affected
+Vulnerability Itlb multihit:        Not affected
+Vulnerability L1tf:                 Not affected
+Vulnerability Mds:                  Not affected
+Vulnerability Meltdown:             Not affected
+Vulnerability Mmio stale data:      Not affected
+Vulnerability Retbleed:             Vulnerable
+Vulnerability Srbds:                Not affected
+Vulnerability Tsx async abort:      Not affected
+Flags:                              fpu vme de pse tsc
+"""
+
+LSCPU_OUTPUT_WITH_MAX_MHZ = """
 Architecture:          x86_64
 CPU op-mode(s):        32-bit, 64-bit
 Byte Order:            Little Endian
@@ -313,7 +391,7 @@ L3 cache:              10240K
 NUMA node0 CPU(s):     0-3
 """
 
-LSCPU_OUTPUT_NO_MAX_MHZ = """
+LSCPU_OUTPUT_NO_FLAGS = """
 Architecture:          x86_64
 CPU op-mode(s):        32-bit, 64-bit
 Byte Order:            Little Endian
@@ -338,10 +416,73 @@ L3 cache:              15360K
 NUMA node0 CPU(s):     0-11
 """
 
-# NOTE(dtanstur): flags list stripped down for sanity reasons
-CPUINFO_FLAGS_OUTPUT = """
+
+PROC_CPUINFO_OUTPUT = """
+processor       : 0
+vendor_id       : AuthenticAMD
+cpu family      : 23
+model           : 49
+model name      : AMD EPYC 7282 16-Core Processor
+stepping        : 0
+microcode       : 0x8301055
+cpu MHz         : 2794.748
+cache size      : 512 KB
+physical id     : 0
+siblings        : 6
+core id         : 0
+cpu cores       : 6
+apicid          : 0
+initial apicid  : 0
+fpu             : yes
+fpu_exception   : yes
+cpuid level     : 16
+wp              : yes
 flags           : fpu vme de pse
+bugs            : sysret_ss_attrs
+bogomips        : 5589.49
+TLB size        : 1024 4K pages
+clflush size    : 64
+cache_alignment : 64
+address sizes   : 40 bits physical, 48 bits virtual
+power management:
+
+processor       : 1
+vendor_id       : AuthenticAMD
+cpu family      : 23
+model           : 49
+model name      : AMD EPYC 7282 16-Core Processor
+stepping        : 0
+microcode       : 0x8301055
+cpu MHz         : 2794.748
+cache size      : 512 KB
+physical id     : 0
+siblings        : 6
+core id         : 1
+cpu cores       : 6
+apicid          : 1
+initial apicid  : 1
+fpu             : yes
+fpu_exception   : yes
+cpuid level     : 16
+wp              : yes
+flags           : fpu vme de pse
+bogomips        : 5589.49
+TLB size        : 1024 4K pages
+clflush size    : 64
+cache_alignment : 64
+address sizes   : 40 bits physical, 48 bits virtual
+power management:
+
 """
+
+ILLEGAL_PROC_FLAGS = PROC_CPUINFO_OUTPUT.replace(
+    "fpu vme de pse", "I am not a flag"
+)
+
+# NO PROC FLAGS should remove the lines with the word flags
+NO_PROC_FLAGS = PROC_CPUINFO_OUTPUT.replace(
+    "flags           : fpu vme de pse\n", ""
+)
 
 LSHW_JSON_OUTPUT_V1 = ("""
 {
@@ -447,6 +588,28 @@ LSHW_JSON_OUTPUT_V1 = ("""
         "ethernet": true,
         "physical": "Physical interface"
       }
+    },
+    {
+      "id": "usb",
+      "class": "bus",
+      "children": [
+        {
+          "id": "usbhost:0",
+          "class": "bus",
+          "children": [
+            {
+              "id": "usb",
+              "class": "generic",
+              "handle": "USB:1:2",
+              "description": "Generic USB device",
+              "product": "MyProduct",
+              "vendor": "MyVendor",
+              "physid": "1",
+              "businfo": "usb@1:1"
+            }
+          ]
+        }
+      ]
     }
   ]
 }
@@ -490,6 +653,34 @@ LSHW_JSON_OUTPUT_V2 = ("""
       "serial" : "1234",
       "slot" : "NULL",
       "children" : [
+        {
+          "id": "firmware",
+          "class": "memory",
+          "claimed": true,
+          "description": "BIOS",
+          "vendor": "BIOSVNDR",
+          "physid": "0",
+          "version": "1.2.3",
+          "date": "03/30/2023",
+          "units": "bytes",
+          "size": 65536,
+          "capacity": 16777216,
+          "capabilities": {
+            "isa": "ISA bus",
+            "pci": "PCI bus",
+            "pnp": "Plug-and-Play",
+            "upgrade": "BIOS EEPROM can be upgraded",
+            "shadowing": "BIOS shadowing",
+            "cdboot": "Booting from CD-ROM/DVD",
+            "bootselect": "Selectable boot path",
+            "edd": "Enhanced Disk Drive extensions",
+            "acpi": "ACPI",
+            "usb": "USB legacy emulation",
+            "biosbootspecification": "BIOS boot specification",
+            "netboot": "Function-key initiated network service boot",
+            "uefi": "UEFI specification is supported"
+          }
+        },
         {
           "id" : "memory:0",
           "class" : "memory",
@@ -633,6 +824,60 @@ LSHW_JSON_OUTPUT_V2 = ("""
           "id" : "memory:5",
           "class" : "memory",
           "physid" : "2"
+        },
+        {
+          "id" : "network:0",
+          "class" : "network",
+          "handle" : "PCI:0000:00:14.3",
+          "description" : "Wireless interface",
+          "product" : "ABCD",
+          "vendor" : "ABCD",
+          "physid" : "14.3",
+          "businfo" : "pci@0000:00:14.3",
+          "logicalname" : "wlp0s20f3",
+          "width" : 64,
+          "clock" : 33000000,
+          "capabilities" : {
+            "pm" : "Power Management",
+            "msi" : "Message Signalled Interrupts",
+            "pciexpress" : "PCI Express",
+            "msix" : "MSI-X",
+            "bus_master" : "bus mastering",
+            "cap_list" : "PCI capabilities listing",
+            "ethernet" : true,
+            "physical" : "Physical interface",
+            "wireless" : "Wireless-LAN"
+          }
+        },
+        {
+          "id" : "network:1",
+          "class" : "network",
+          "handle" : "PCI:0000:00:1f.6",
+          "description" : "Ethernet interface",
+          "product" : "DCBA",
+          "vendor" : "DCBA",
+          "physid" : "1f.6",
+          "businfo" : "pci@0000:00:1f.6",
+          "logicalname" : "eth0",
+          "units" : "bit/s",
+          "capacity" : 1000000000,
+          "width" : 32,
+          "clock" : 33000000,
+          "capabilities" : {
+            "pm" : "Power Management",
+            "msi" : "Message Signalled Interrupts",
+            "bus_master" : "bus mastering",
+            "cap_list" : "PCI capabilities listing",
+            "ethernet" : true,
+            "physical" : "Physical interface",
+            "tp" : "twisted pair",
+            "10bt" : "10Mbit/s",
+            "10bt-fd" : "10Mbit/s (full duplex)",
+            "100bt" : "100Mbit/s",
+            "100bt-fd" : "100Mbit/s (full duplex)",
+            "1000bt-fd" : "1Gbit/s (full duplex)",
+            "autonegotiation" : "Auto-negotiation"
+          }
         }
       ]
     }
@@ -1157,7 +1402,7 @@ MDADM_EXAMINE_OUTPUT_MEMBER = ("""/dev/sda1:
         Version : 1.2
     Feature Map : 0x0
      Array UUID : 83143055:2781ddf5:2c8f44c7:9b45d92e
-           Name : horse.cern.ch:1  (local to host abc.xyz.com)
+           Name : horse.cern.ch:this_name  (local to host abc.xyz.com)
   Creation Time : Tue Jun 11 12:43:37 2019
      Raid Level : raid1
    Raid Devices : 2
@@ -1682,8 +1927,38 @@ MULTIPATH_VALID_PATH = '%s is a valid multipath device path'
 MULTIPATH_INVALID_PATH = '%s is not a valid multipath device path'
 
 MULTIPATH_LINKS_DM = (
-    'SUPER_FRIENDLY_NAME %s ATA,INTEL SSDSC2CT06\n'
+    'SUPER_FRIENDLY_ NAME (12345) %s ATA, INTEL SSDSC2CT06\n'
     'size=56G features=\'1 retain_attached_hw_handler\' hwhandler=\'0\' wp=rw\n'  # noqa
     ' `-+- policy=\'service-time 0\' prio=1 status=active\n'
     '  `- 0:0:0:0 device s  8:0  active ready running\n'
 )
+
+LSBLK_OUPUT = ("""
+NAME="sda" TYPE="disk" FSTYPE=""
+NAME="sdb" TYPE="disk" FSTYPE=""
+""")
+
+LSBLK_OUPUT_ESP_RAID = ("""
+NAME="sda" TYPE="disk" FSTYPE=""
+NAME="sda1" TYPE="part" FSTYPE="linux_raid_member"
+NAME="md127" TYPE="raid1" FSTYPE=""
+NAME="md127p1" TYPE="md" FSTYPE="xfs"
+NAME="md127p2" TYPE="md" FSTYPE="iso9660"
+NAME="md127p14" TYPE="md" FSTYPE=""
+NAME="md127p15" TYPE="md" FSTYPE=""
+NAME="sda2" TYPE="part" FSTYPE="linux_raid_member"
+NAME="md126" TYPE="raid0" FSTYPE=""
+NAME="sda3" TYPE="part" FSTYPE="linux_raid_member"
+NAME="md125" TYPE="raid1" FSTYPE="vfat"
+NAME="sdb" TYPE="disk" FSTYPE=""
+NAME="sdb1" TYPE="part" FSTYPE="linux_raid_member"
+NAME="md127" TYPE="raid1" FSTYPE=""
+NAME="md127p1" TYPE="md" FSTYPE="xfs"
+NAME="md127p2" TYPE="md" FSTYPE="iso9660"
+NAME="md127p14" TYPE="md" FSTYPE=""
+NAME="md127p15" TYPE="md" FSTYPE=""
+NAME="sdb2" TYPE="part" FSTYPE="linux_raid_member"
+NAME="md126" TYPE="raid0" FSTYPE=""
+NAME="sdb3" TYPE="part" FSTYPE="linux_raid_member"
+NAME="md125" TYPE="raid1" FSTYPE="vfat"
+""")

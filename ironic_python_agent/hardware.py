@@ -15,7 +15,10 @@
 import abc
 import binascii
 import collections
+import contextlib
 import functools
+import glob
+import io
 import ipaddress
 import json
 from multiprocessing.pool import ThreadPool
@@ -26,9 +29,8 @@ import shutil
 import stat
 import string
 import time
+from typing import List
 
-from ironic_lib import disk_utils
-from ironic_lib import utils as il_utils
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log
@@ -39,6 +41,9 @@ import stevedore
 import yaml
 
 from ironic_python_agent import burnin
+from ironic_python_agent import device_hints
+from ironic_python_agent import disk_utils
+from ironic_python_agent import efi_utils
 from ironic_python_agent import encoding
 from ironic_python_agent import errors
 from ironic_python_agent.extensions import base as ext_base
@@ -49,7 +54,7 @@ from ironic_python_agent import tls_utils
 from ironic_python_agent import utils
 
 _global_managers = None
-LOG = log.getLogger()
+LOG = log.getLogger(__name__)
 CONF = cfg.CONF
 
 WARN_BIOSDEVNAME_NOT_FOUND = False
@@ -57,6 +62,9 @@ WARN_BIOSDEVNAME_NOT_FOUND = False
 UNIT_CONVERTER = pint.UnitRegistry(filename=None)
 UNIT_CONVERTER.define('bytes = []')
 UNIT_CONVERTER.define('MB = 1048576 bytes')
+UNIT_CONVERTER.define('bit_s = []')
+UNIT_CONVERTER.define('Mbit_s = 1000000 * bit_s')
+UNIT_CONVERTER.define('Gbit_s = 1000 * Mbit_s')
 _MEMORY_ID_RE = re.compile(r'^memory(:\d+)?$')
 NODE = None
 API_CLIENT = None
@@ -81,6 +89,24 @@ RAID_APPLY_CONFIGURATION_ARGSINFO = {
     }
 }
 
+DEFAULT_CLEAN_UEFI_NVRAM_MATCH_PATTERNS = [
+    r'^HD\(',
+    r'shim.*\.efi',
+    r'grub.*\.efi'
+]
+DEPLOY_CLEAN_UEFI_NVRAM_ARGSINFO = {
+    "match_patterns": {
+        "description": (
+            "Json blob contains a list of regex patterns where any UEFI "
+            "NVRAM entry matching that pattern will be deleted. "
+            "Default value is "
+            "'[\"{}\"]'".format('", "'.join(
+                DEFAULT_CLEAN_UEFI_NVRAM_MATCH_PATTERNS))
+        ),
+        "required": False,
+    }
+}
+
 MULTIPATH_ENABLED = None
 
 
@@ -92,41 +118,9 @@ def _get_device_info(dev, devclass, field):
                   'r') as f:
             return f.read().strip()
     except IOError:
-        LOG.warning("Can't find field %(field)s for"
+        LOG.warning("Can't find field %(field)s for "
                     "device %(dev)s in device class %(class)s",
                     {'field': field, 'dev': dev, 'class': devclass})
-
-
-def _get_system_lshw_dict():
-    """Get a dict representation of the system from lshw
-
-    Retrieves a json representation of the system from lshw and converts
-    it to a python dict
-
-    :return: A python dict from the lshw json output
-    """
-    out, _e = il_utils.execute('lshw', '-quiet', '-json', log_stdout=False)
-    out = json.loads(out)
-    # Depending on lshw version, output might be a list, starting with
-    # https://github.com/lyonel/lshw/commit/135a853c60582b14c5b67e5cd988a8062d9896f4  # noqa
-    if isinstance(out, list):
-        return out[0]
-    return out
-
-
-def _udev_settle():
-    """Wait for the udev event queue to settle.
-
-    Wait for the udev event queue to settle to make sure all devices
-    are detected once the machine boots up.
-
-    """
-    try:
-        il_utils.execute('udevadm', 'settle')
-    except processutils.ProcessExecutionError as e:
-        LOG.warning('Something went wrong when waiting for udev '
-                    'to settle. Error: %s', e)
-        return
 
 
 def _load_ipmi_modules():
@@ -135,9 +129,14 @@ def _load_ipmi_modules():
     This is required to be called at least once before attempting to use
     ipmitool or related tools.
     """
-    il_utils.try_execute('modprobe', 'ipmi_msghandler')
-    il_utils.try_execute('modprobe', 'ipmi_devintf')
-    il_utils.try_execute('modprobe', 'ipmi_si')
+
+    ipmi_drivers = ['ipmi_msghandler', 'ipmi_devintf', 'ipmi_si']
+    for ipmi_driver in ipmi_drivers:
+        try:
+            processutils.execute('modprobe', ipmi_driver)
+        except (processutils.ProcessExecutionError, OSError):
+            LOG.debug("IPMI driver %s not supported or not present",
+                      ipmi_driver)
 
 
 def _load_multipath_modules():
@@ -156,18 +155,18 @@ def _load_multipath_modules():
         # which is not *really* required.. at least *shouldn't* be.
         # WARNING(TheJulia): This command explicitly replaces local
         # configuration.
-        il_utils.try_execute('/usr/sbin/mpathconf', '--enable',
-                             '--find_multipaths', 'yes',
-                             '--with_module', 'y',
-                             '--with_multipathd', 'y')
+        utils.try_execute('/usr/sbin/mpathconf', '--enable',
+                          '--find_multipaths', 'yes',
+                          '--with_module', 'y',
+                          '--with_multipathd', 'y')
     else:
         # Ensure modules are loaded. Configuration is not required
         # and implied based upon compiled in defaults.
         # NOTE(TheJulia): Debian/Ubuntu specifically just document
         # using `multipath -t` output to start a new configuration
         # file, if needed.
-        il_utils.try_execute('modprobe', 'dm_multipath')
-        il_utils.try_execute('modprobe', 'multipath')
+        utils.try_execute('modprobe', 'dm_multipath')
+        utils.try_execute('modprobe', 'multipath')
 
 
 def _check_for_iscsi():
@@ -179,13 +178,13 @@ def _check_for_iscsi():
     - If no connection is detected we simply return.
     """
     try:
-        il_utils.execute('iscsistart', '-f')
+        utils.execute('iscsistart', '-f')
     except (processutils.ProcessExecutionError, EnvironmentError) as e:
         LOG.debug("No iscsi connection detected. Skipping iscsi. "
                   "Error: %s", e)
         return
     try:
-        il_utils.execute('iscsistart', '-b')
+        utils.execute('iscsistart', '-b')
     except processutils.ProcessExecutionError as e:
         LOG.warning("Something went wrong executing 'iscsistart -b' "
                     "Error: %s", e)
@@ -198,8 +197,8 @@ def _get_md_uuid(raid_device):
     :returns: A string containing the UUID of an md device.
     """
     try:
-        out, _ = il_utils.execute('mdadm', '--detail', raid_device,
-                                  use_standard_locale=True)
+        out, _ = utils.execute('mdadm', '--detail', raid_device,
+                               use_standard_locale=True)
     except processutils.ProcessExecutionError as e:
         LOG.warning('Could not get the details of %(dev)s: %(err)s',
                     {'dev': raid_device, 'err': e})
@@ -225,21 +224,26 @@ def _enable_multipath():
         # NOTE(TheJulia): Testing locally, a prior running multipathd, the
         # explicit multipathd start just appears to silently exit with a
         # result code of 0.
-        il_utils.execute('multipathd')
+        # NOTE(rozzix): This could cause an OS error:
+        # "process is already running failed to create pid file" depending on
+        # the multipathd version in case multipathd is already running.
+        # The safest way to start multipathd is to expect OS error in addition
+        # to the execution error and handle both as inconsequential.
+        utils.try_execute('multipathd')
         # This is mainly to get the system to actually do the needful and
         # identify/enumerate paths by combining what it can detect and what
         # it already knows. This may be useful, and in theory this should be
         # logged in the IPA log should it be needed.
-        il_utils.execute('multipath', '-ll')
-        return True
+        utils.execute('multipath', '-ll')
     except FileNotFoundError as e:
         LOG.warning('Attempted to determine if multipath tools were present. '
                     'Not detected. Error recorded: %s', e)
         return False
-    except processutils.ProcessExecutionError as e:
+    except (processutils.ProcessExecutionError, OSError) as e:
         LOG.warning('Attempted to invoke multipath utilities, but we '
                     'encountered an error: %s', e)
         return False
+    return True
 
 
 def _get_multipath_parent_device(device):
@@ -252,7 +256,7 @@ def _get_multipath_parent_device(device):
         # Explicitly run the check as regardless of if the device is mpath or
         # not, multipath tools when using list always exits with a return
         # code of 0.
-        il_utils.execute('multipath', '-c', check_device)
+        utils.execute('multipath', '-c', check_device)
         # path check with return an exit code of 1 if you send it a multipath
         # device mapper device, like dm-0.
         # NOTE(TheJulia): -ll is supposed to load from all available
@@ -260,7 +264,7 @@ def _get_multipath_parent_device(device):
         # that. That being said, it has been about a decade since I was
         # running multipath tools on SAN connected gear, so my memory is
         # definitely fuzzy.
-        out, _ = il_utils.execute('multipath', '-ll', check_device)
+        out, _ = utils.execute('multipath', '-ll', check_device)
     except processutils.ProcessExecutionError as e:
         # FileNotFoundError if the utility does not exist.
         # -1 return code if the device is not valid.
@@ -281,11 +285,15 @@ def _get_multipath_parent_device(device):
     # size=56G features='1 retain_attached_hw_handler' hwhandler='0' wp=rw
     # `-+- policy='service-time 0' prio=1 status=active
     #   `- 0:0:0:0 sda 8:0  active ready running
+    # Other format:
+    # mpathat (wwid/alias) device_name vendor,product
     try:
         lines = out.splitlines()
-        mpath_device = lines[0].split(' ')[1]
-        # give back something like dm-0 so we can log it.
-        return mpath_device
+        mpath_device_out = lines[0].split(' ')
+        for mpath_device in mpath_device_out:
+            if mpath_device.startswith("dm"):
+                # give back something like dm-0 so we can log it.
+                return mpath_device
     except IndexError:
         # We didn't get any command output, so Nope.
         pass
@@ -315,8 +323,8 @@ def get_component_devices(raid_device):
                                                 ignore_raid=True))
     for bdev in block_devices:
         try:
-            out, _ = il_utils.execute('mdadm', '--examine', bdev.name,
-                                      use_standard_locale=True)
+            out, _ = utils.execute('mdadm', '--examine', bdev.name,
+                                   use_standard_locale=True)
         except processutils.ProcessExecutionError as e:
             if "No md superblock detected" in str(e):
                 # actually not a component device
@@ -338,22 +346,16 @@ def get_component_devices(raid_device):
 
 def _calc_memory(sys_dict):
     physical = 0
-    for sys_child in sys_dict['children']:
-        if sys_child['id'] != 'core':
-            continue
-        for core_child in sys_child['children']:
-            if not _MEMORY_ID_RE.match(core_child['id']):
-                continue
-            if core_child.get('size'):
-                value = ("%(size)s %(units)s" % core_child)
-                physical += int(UNIT_CONVERTER(value).to
-                                ('MB').magnitude)
-            else:
-                for bank in core_child.get('children', ()):
-                    if bank.get('size'):
-                        value = ("%(size)s %(units)s" % bank)
-                        physical += int(UNIT_CONVERTER(value).to
-                                        ('MB').magnitude)
+    core_dict = next(utils.find_in_lshw(sys_dict, 'core'), {})
+    for core_child in utils.find_in_lshw(core_dict, _MEMORY_ID_RE):
+        if core_child.get('size'):
+            value = ("%(size)s %(units)s" % core_child)
+            physical += int(UNIT_CONVERTER(value).to('MB').magnitude)
+        else:
+            for bank in core_child.get('children', ()):
+                if bank.get('size'):
+                    value = ("%(size)s %(units)s" % bank)
+                    physical += int(UNIT_CONVERTER(value).to('MB').magnitude)
     return physical
 
 
@@ -369,8 +371,8 @@ def get_holder_disks(raid_device):
         return []
 
     try:
-        out, _ = il_utils.execute('mdadm', '--detail', raid_device,
-                                  use_standard_locale=True)
+        out, _ = utils.execute('mdadm', '--detail', raid_device,
+                               use_standard_locale=True)
     except processutils.ProcessExecutionError as e:
         LOG.warning('Could not get holder disks of %(dev)s: %(err)s',
                     {'dev': raid_device, 'err': e})
@@ -414,7 +416,7 @@ def is_md_device(raid_device):
     :returns: True if the device is an md device, False otherwise.
     """
     try:
-        il_utils.execute('mdadm', '--detail', raid_device)
+        utils.execute('mdadm', '--detail', raid_device)
         LOG.debug("%s is an md device", raid_device)
         return True
     except FileNotFoundError:
@@ -437,9 +439,9 @@ def md_restart(raid_device):
     try:
         LOG.debug('Restarting software RAID device %s', raid_device)
         component_devices = get_component_devices(raid_device)
-        il_utils.execute('mdadm', '--stop', raid_device)
-        il_utils.execute('mdadm', '--assemble', raid_device,
-                         *component_devices)
+        utils.execute('mdadm', '--stop', raid_device)
+        utils.execute('mdadm', '--assemble', raid_device,
+                      *component_devices)
     except processutils.ProcessExecutionError as e:
         error_msg = ('Could not restart md device %(dev)s: %(err)s' %
                      {'dev': raid_device, 'err': e})
@@ -450,10 +452,12 @@ def md_restart(raid_device):
 def md_get_raid_devices():
     """Get all discovered Software RAID (md) devices
 
-    :return: A python dict containing details about the discovered RAID
+    :returns: A python dict containing details about the discovered RAID
       devices
     """
-    report = il_utils.execute('mdadm', '--examine', '--scan')[0]
+    # Note(Boushra): mdadm output is similar to lsblk, but not
+    # identical; do not use utils.parse_device_tags
+    report = utils.execute('mdadm', '--examine', '--scan')[0]
     lines = report.splitlines()
     result = {}
     for line in lines:
@@ -471,7 +475,7 @@ def _md_scan_and_assemble():
     This call does not fail if no md devices are present.
     """
     try:
-        il_utils.execute('mdadm', '--assemble', '--scan', '--verbose')
+        utils.execute('mdadm', '--assemble', '--scan', '--verbose')
     except FileNotFoundError:
         LOG.warning('mdadm has not been found, RAID devices will not be '
                     'supported')
@@ -483,7 +487,8 @@ def list_all_block_devices(block_type='disk',
                            ignore_raid=False,
                            ignore_floppy=True,
                            ignore_empty=True,
-                           ignore_multipath=False):
+                           ignore_multipath=False,
+                           all_serial_and_wwn=False):
     """List all physical block devices
 
     The switches we use for lsblk: P for KEY="value" output, b for size output
@@ -493,7 +498,8 @@ def list_all_block_devices(block_type='disk',
     Broken out as its own function to facilitate custom hardware managers that
     don't need to subclass GenericHardwareManager.
 
-    :param block_type: Type of block device to find
+    :param block_type: Type(s) of block device to find.
+                       Can be a string or a list of strings.
     :param ignore_raid: Ignore auto-identified raid devices, example: md0
                         Defaults to false as these are generally disk
                         devices and should be treated as such if encountered.
@@ -503,7 +509,14 @@ def list_all_block_devices(block_type='disk',
     :param ignore_multipath: Whether to ignore devices backing multipath
                              devices. Default is to consider multipath
                              devices, if possible.
-    :return: A list of BlockDevices
+    :param all_serial_and_wwn: Don't collect serial and wwn numbers based
+                               on a priority order, instead collect wwn
+                               numbers from both udevadm and lsblk. When
+                               enabled this option will also collect both
+                               the short and the long serial from udevadm if
+                               possible.
+
+    :returns: A list of BlockDevices
     """
 
     def _is_known_device(existing, new_device_name):
@@ -513,9 +526,17 @@ def list_all_block_devices(block_type='disk',
                 return True
         return False
 
+    # Normalize block_type to a list
+    if isinstance(block_type, str):
+        block_types = [block_type]
+    elif isinstance(block_type, list):
+        block_types = block_type
+    else:
+        raise ValueError("block_type must be a string or a list of strings")
+
     check_multipath = not ignore_multipath and get_multipath_status()
 
-    _udev_settle()
+    disk_utils.udev_settle()
 
     # map device names to /dev/disk/by-path symbolic links that points to it
 
@@ -541,9 +562,9 @@ def list_all_block_devices(block_type='disk',
                     "Cause: %(error)s", {'path': disk_by_path_dir, 'error': e})
 
     columns = utils.LSBLK_COLUMNS
-    report = il_utils.execute('lsblk', '-bia', '--json',
-                              '-o{}'.format(','.join(columns)),
-                              check_exit_code=[0])[0]
+    report = utils.execute('lsblk', '-bia', '--json',
+                           '-o{}'.format(','.join(columns)),
+                           check_exit_code=[0])[0]
 
     try:
         report_json = json.loads(report)
@@ -589,22 +610,22 @@ def list_all_block_devices(block_type='disk',
         # Other possible type values, which we skip recording:
         #   lvm, part, rom, loop
 
-        if devtype != block_type:
+        if devtype not in block_types:
             if devtype is None or ignore_raid:
                 LOG.debug(
-                    "TYPE did not match. Wanted: %(block_type)s but found: "
+                    "TYPE did not match. Wanted: %(block_types)s but found: "
                     "%(devtype)s (RAID devices are ignored)",
-                    {'block_type': block_type, 'devtype': devtype})
+                    {'block_types': block_types, 'devtype': devtype})
                 continue
             elif ('raid' in devtype
-                  and block_type in ['raid', 'disk', 'mpath']):
+                  and any(bt in ['raid', 'disk', 'mpath']
+                          for bt in block_types)):
                 LOG.debug(
                     "TYPE detected to contain 'raid', signifying a "
                     "RAID volume. Found: %(device_raw)s",
                     {'device_raw': device_raw})
             elif (devtype == 'md'
-                  and (block_type == 'part'
-                       or block_type == 'md')):
+                  and any(bt in ['part', 'md'] for bt in block_types)):
                 # NOTE(dszumski): Partitions on software RAID devices have type
                 # 'md'. This may also contain RAID devices in a broken state in
                 # rare occasions. See https://review.opendev.org/#/c/670807 for
@@ -613,7 +634,8 @@ def list_all_block_devices(block_type='disk',
                     "TYPE detected to contain 'md', signifying a "
                     "RAID partition. Found: %(device_raw)s",
                     {'device_raw': device_raw})
-            elif devtype == 'mpath' and block_type == 'disk':
+            elif (devtype == 'mpath' and any(bt == 'disk'
+                                             for bt in block_types)):
                 LOG.debug(
                     "TYPE detected to contain 'mpath', "
                     "signifing a device mapper multipath device. "
@@ -621,9 +643,9 @@ def list_all_block_devices(block_type='disk',
                     {'device_raw': device_raw})
             else:
                 LOG.debug(
-                    "TYPE did not match. Wanted: %(block_type)s but found: "
+                    "TYPE did not match. Wanted: %(block_types)s but found: "
                     "%(device_raw)s (RAID devices are ignored)",
-                    {'block_type': block_type, 'device_raw': device_raw})
+                    {'block_types': block_types, 'device_raw': device_raw})
                 continue
 
         # Ensure all required columns are at least present, even if blank
@@ -649,8 +671,15 @@ def list_all_block_devices(block_type='disk',
 
         extra = {}
         lsblk_serial = device_raw.get('serial')
-        if lsblk_serial:
-            extra['serial'] = lsblk_serial
+        lsblk_wwn = device_raw.get('wwn')
+        if all_serial_and_wwn:
+            extra['serial'] = [lsblk_serial]
+            extra['wwn'] = [lsblk_wwn]
+        else:
+            if lsblk_serial:
+                extra['serial'] = lsblk_serial
+            if lsblk_wwn:
+                extra['wwn'] = lsblk_wwn
         try:
             udev = pyudev.Devices.from_device_file(context, name)
         except pyudev.DeviceNotFoundByFileError as e:
@@ -670,18 +699,23 @@ def list_all_block_devices(block_type='disk',
             ]
             # Only check device serial information from udev
             # when lsblk returned None
-            if not lsblk_serial:
+            if all_serial_and_wwn or not lsblk_serial:
                 udev_property_mappings += [
                     ('serial', 'SERIAL_SHORT'),
                     ('serial', 'SERIAL')
                 ]
             for key, udev_key in udev_property_mappings:
-                if key in extra:
-                    continue
-                value = (udev.get(f'ID_{udev_key}')
-                         or udev.get(f'DM_{udev_key}'))  # devicemapper
-                if value:
-                    extra[key] = value
+                if all_serial_and_wwn and (key == 'wwn' or key == 'serial'):
+                    value = (udev.get(f'ID_{udev_key}')
+                             or udev.get(f'DM_{udev_key}'))  # devicemapper
+                    extra[key].append(value)
+                else:
+                    if key in extra:
+                        continue
+                    value = (udev.get(f'ID_{udev_key}')
+                             or udev.get(f'DM_{udev_key}'))  # devicemapper
+                    if value:
+                        extra[key] = value
 
         # NOTE(lucasagomes): Newer versions of the lsblk tool supports
         # HCTL as a parameter but let's get it from sysfs to avoid breaking
@@ -705,12 +739,15 @@ def list_all_block_devices(block_type='disk',
                                    by_path=by_path_name,
                                    uuid=device_raw['uuid'],
                                    partuuid=device_raw['partuuid'],
+                                   logical_sectors=device_raw['log-sec'],
+                                   physical_sectors=device_raw['phy-sec'],
+                                   tran=device_raw['tran'] or None,
                                    **extra))
     return devices
 
 
 def save_api_client(client=None, timeout=None, interval=None):
-    """Preserves access to the API client for potential later re-use."""
+    """Preserves access to the API client for potential later reuse."""
     global API_CLIENT, API_LOOKUP_TIMEOUT, API_LOOKUP_INTERVAL
 
     if client and timeout and interval and not API_CLIENT:
@@ -720,7 +757,7 @@ def save_api_client(client=None, timeout=None, interval=None):
 
 
 def update_cached_node():
-    """Attmepts to update the node cache via the API"""
+    """Attempts to update the node cache via the API"""
     cached_node = get_cached_node()
     if API_CLIENT:
         LOG.info('Agent is requesting to perform an explicit node cache '
@@ -767,12 +804,14 @@ class HardwareType(object):
 class BlockDevice(encoding.SerializableComparable):
     serializable_fields = ('name', 'model', 'size', 'rotational',
                            'wwn', 'serial', 'vendor', 'wwn_with_extension',
-                           'wwn_vendor_extension', 'hctl', 'by_path')
+                           'wwn_vendor_extension', 'hctl', 'by_path',
+                           'logical_sectors', 'physical_sectors', 'tran')
 
     def __init__(self, name, model, size, rotational, wwn=None, serial=None,
                  vendor=None, wwn_with_extension=None,
                  wwn_vendor_extension=None, hctl=None, by_path=None,
-                 uuid=None, partuuid=None):
+                 uuid=None, partuuid=None,
+                 logical_sectors=None, physical_sectors=None, tran=None):
         self.name = name
         self.model = model
         self.size = size
@@ -786,17 +825,22 @@ class BlockDevice(encoding.SerializableComparable):
         self.hctl = hctl
         self.by_path = by_path
         self.partuuid = partuuid
+        self.logical_sectors = logical_sectors
+        self.physical_sectors = physical_sectors
+        self.tran = tran
 
 
 class NetworkInterface(encoding.SerializableComparable):
     serializable_fields = ('name', 'mac_address', 'ipv4_address',
                            'ipv6_address', 'has_carrier', 'lldp',
                            'vendor', 'product', 'client_id',
-                           'biosdevname')
+                           'biosdevname', 'speed_mbps', 'pci_address',
+                           'driver')
 
     def __init__(self, name, mac_addr, ipv4_address=None, ipv6_address=None,
                  has_carrier=True, lldp=None, vendor=None, product=None,
-                 client_id=None, biosdevname=None):
+                 client_id=None, biosdevname=None, speed_mbps=None,
+                 pci_address=None, driver=None):
         self.name = name
         self.mac_address = mac_addr
         self.ipv4_address = ipv4_address
@@ -806,23 +850,43 @@ class NetworkInterface(encoding.SerializableComparable):
         self.vendor = vendor
         self.product = product
         self.biosdevname = biosdevname
+        self.speed_mbps = speed_mbps
+        self.pci_address = pci_address
+        self.driver = driver
         # client_id is used for InfiniBand only. we calculate the DHCP
         # client identifier Option to allow DHCP to work over InfiniBand.
         # see https://tools.ietf.org/html/rfc4390
         self.client_id = client_id
 
 
+class CPUCore(encoding.SerializableComparable):
+    serializable_fields = ('model_name', 'frequency', 'count', 'architecture',
+                           'flags', 'core_id')
+
+    def __init__(self, model_name, frequency, architecture,
+                 core_id, flags=None):
+        self.model_name = model_name
+        self.frequency = frequency
+        self.architecture = architecture
+        self.core_id = core_id
+
+        self.flags = flags or []
+
+
 class CPU(encoding.SerializableComparable):
     serializable_fields = ('model_name', 'frequency', 'count', 'architecture',
-                           'flags')
+                           'flags', 'socket_count')
 
     def __init__(self, model_name, frequency, count, architecture,
-                 flags=None):
+                 flags=None, socket_count=None, cpus: List[CPUCore] = None):
         self.model_name = model_name
         self.frequency = frequency
         self.count = count
+        self.socket_count = socket_count
         self.architecture = architecture
         self.flags = flags or []
+
+        self.cpus = cpus or []
 
 
 class Memory(encoding.SerializableComparable):
@@ -834,13 +898,33 @@ class Memory(encoding.SerializableComparable):
         self.physical_mb = physical_mb
 
 
-class SystemVendorInfo(encoding.SerializableComparable):
-    serializable_fields = ('product_name', 'serial_number', 'manufacturer')
+class SystemFirmware(encoding.SerializableComparable):
+    serializable_fields = ('vendor', 'version', 'build_date')
 
-    def __init__(self, product_name, serial_number, manufacturer):
+    def __init__(self, vendor, version, build_date):
+        self.version = version
+        self.build_date = build_date
+        self.vendor = vendor
+
+
+class SystemVendorInfo(encoding.SerializableComparable):
+    serializable_fields = ('product_name', 'serial_number', 'manufacturer',
+                           'firmware')
+
+    def __init__(self, product_name, serial_number, manufacturer, firmware):
         self.product_name = product_name
         self.serial_number = serial_number
         self.manufacturer = manufacturer
+        self.firmware = firmware
+
+
+class USBInfo(encoding.SerializableComparable):
+    serializable_fields = ('product', 'vendor', 'handle')
+
+    def __init__(self, product, vendor, handle):
+        self.product = product
+        self.vendor = vendor
+        self.handle = handle
 
 
 class BootInfo(encoding.SerializableComparable):
@@ -854,9 +938,30 @@ class BootInfo(encoding.SerializableComparable):
 class HardwareManager(object, metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def evaluate_hardware_support(self):
-        pass
+        """Evaluate the level of support for this hardware manager.
+
+        See the HardwareSupport object for more documentation.
+
+        :returns: One of the constants from the HardwareSupport object.
+        """
+
+    def initialize(self):
+        """Initialize the hardware manager.
+
+        This method is invoked for all hardware managers in the order of their
+        support level after their evaluate_hardware_support returns a value
+        greater than NONE.
+
+        Be careful when making hardware manager calls from initialize: other
+        hardware manager with the same or lower support level may not be
+        initialized yet. It's only safe when you're sure that the current
+        hardware manager provides the call.
+        """
 
     def list_network_interfaces(self):
+        raise errors.IncompatibleHardwareMethodError
+
+    def collect_lldp_data(self, interface_names=None):
         raise errors.IncompatibleHardwareMethodError
 
     def get_cpus(self):
@@ -866,18 +971,25 @@ class HardwareManager(object, metaclass=abc.ABCMeta):
         """List physical block devices
 
         :param include_partitions: If to include partitions
-        :return: A list of BlockDevices
+        :returns: A list of BlockDevices
         """
         raise errors.IncompatibleHardwareMethodError
 
-    def get_skip_list_from_node(self, node,
-                                block_devices=None, just_raids=False):
+    def get_skip_list_from_node_for_disks(self, node,
+                                          block_devices=None):
+        """Get the skip block devices list from the node for physical disks
+
+        :param node: A node to be check for the 'skip_block_devices' property
+        :param block_devices: a list of BlockDevices
+        :returns: A set of names of devices on the skip list
+        """
+        raise errors.IncompatibleHardwareMethodError
+
+    def get_skip_list_from_node_for_raids(self, node):
         """Get the skip block devices list from the node
 
-        :param block_devices: a list of BlockDevices
-        :param just_raids: a boolean to signify that only RAID devices
-                           are important
-        :return: A set of names of devices on the skip list
+        :param node: A node to be check for the 'skip_block_devices' property
+        :returns: A set of volume names of RAID arrays on the skip list
         """
         raise errors.IncompatibleHardwareMethodError
 
@@ -889,7 +1001,7 @@ class HardwareManager(object, metaclass=abc.ABCMeta):
 
         :param node: A node used to check the skip list
         :param include_partitions: If to include partitions
-        :return: A list of BlockDevices
+        :returns: A list of BlockDevices
         """
         raise errors.IncompatibleHardwareMethodError
 
@@ -915,6 +1027,15 @@ class HardwareManager(object, metaclass=abc.ABCMeta):
         raise errors.IncompatibleHardwareMethodError()
 
     def generate_tls_certificate(self, ip_address):
+        raise errors.IncompatibleHardwareMethodError()
+
+    def get_usb_devices(self):
+        """Collect USB devices
+
+        List all USB final devices, based on lshw information
+
+        :returns: a dict, containing product, vendor, and handle information
+        """
         raise errors.IncompatibleHardwareMethodError()
 
     def erase_block_device(self, node, block_device):
@@ -955,11 +1076,11 @@ class HardwareManager(object, metaclass=abc.ABCMeta):
 
         :param node: Ironic node object
         :param ports: list of Ironic port objects
-        :raises: ProtectedDeviceFound if a device has been identified which
+        :raises: ProtectedDeviceError if a device has been identified which
                  may require manual intervention due to the contents and
                  operational risk which exists as it could also be a sign
                  of an environmental misconfiguration.
-        :return: a dictionary in the form {device.name: erasure output}
+        :returns: a dictionary in the form {device.name: erasure output}
         """
         erase_results = {}
         block_devices = self.list_block_devices_check_skip_list(node)
@@ -1020,7 +1141,7 @@ class HardwareManager(object, metaclass=abc.ABCMeta):
         This inventory is sent to Ironic on lookup and to Inspector on
         inspection.
 
-        :return: a dictionary representing inventory
+        :returns: a dictionary representing inventory
         """
         start = time.time()
         LOG.info('Collecting full inventory')
@@ -1093,7 +1214,7 @@ class HardwareManager(object, metaclass=abc.ABCMeta):
 
         :param node: Ironic node object
         :param ports: list of Ironic port objects
-        :return: a list of cleaning steps, where each step is described as a
+        :returns: a list of cleaning steps, where each step is described as a
                  dict as defined above
 
         """
@@ -1142,7 +1263,61 @@ class HardwareManager(object, metaclass=abc.ABCMeta):
 
         :param node: Ironic node object
         :param ports: list of Ironic port objects
-        :return: a list of deploying steps, where each step is described as a
+        :returns: a list of deploying steps, where each step is described as a
+                 dict as defined above
+
+        """
+        return []
+
+    def get_service_steps(self, node, ports):
+        """Get a list of service steps.
+
+        Returns a list of steps. Each step is represented by a dict::
+
+          {
+           'interface': the name of the driver interface that should execute
+                        the step.
+           'step': the HardwareManager function to call.
+           'priority': the order steps will be run in if executed upon
+                       similar to automated cleaning or deployment.
+                       In service steps, the order comes from the user request,
+                       but this similarity is kept for consistency should we
+                       further extend the capability at some point in the
+                       future.
+           'reboot_requested': Whether the agent should request Ironic reboots
+                               the node via the power driver after the
+                               operation completes.
+           'abortable': Boolean value. Whether the service step can be
+                        stopped by the operator or not. Some steps may
+                        cause non-reversible damage to a machine if interrupted
+                        (i.e firmware update), for such steps this parameter
+                        should be set to False. If no value is set for this
+                        parameter, Ironic will consider False (non-abortable).
+          }
+
+
+        If multiple hardware managers return the same step name, the following
+        logic will be used to determine which manager's step "wins":
+
+            * Keep the step that belongs to HardwareManager with highest
+              HardwareSupport (larger int) value.
+            * If equal support level, keep the step with the higher defined
+              priority (larger int).
+            * If equal support level and priority, keep the step associated
+              with the HardwareManager whose name comes earlier in the
+              alphabet.
+
+        The steps will be called using `hardware.dispatch_to_managers` and
+        handled by the best suited hardware manager. If you need a step to be
+        executed by only your hardware manager, ensure it has a unique step
+        name.
+
+        `node` and `ports` can be used by other hardware managers to further
+        determine if a step is supported for the node.
+
+        :param node: Ironic node object
+        :param ports: list of Ironic port objects
+        :returns: a list of service steps, where each step is described as a
                  dict as defined above
 
         """
@@ -1173,18 +1348,68 @@ class HardwareManager(object, metaclass=abc.ABCMeta):
             'version': getattr(self, 'HARDWARE_MANAGER_VERSION', '1.0')
         }
 
+    def collect_system_logs(self, io_dict, file_list):
+        """Collect logs from the system.
+
+        Implementations should update `io_dict` and `file_list` with logs
+        to send to Ironic and Inspector.
+
+        :param io_dict: Dictionary mapping file names to binary IO objects
+            with corresponding data.
+        :param file_list: List of full file paths to include.
+        """
+        raise errors.IncompatibleHardwareMethodError()
+
+    def full_sync(self):
+        """Synchronize all caches to the disk.
+
+        This method will be called on *all* managers before the ramdisk
+        is powered off externally. It is expected to try flush all caches
+        to the disk to avoid data loss.
+        """
+        raise errors.IncompatibleHardwareMethodError()
+
+    def filter_device(self, device):
+        """Filter a device in various listings.
+
+        This call allows hardware managers to change or remove devices in
+        listings, such as list_interfaces or list_block_devices without
+        overriding these calls. Skipped devices will be invisible to the agent,
+        including security-sensitive processes like cleaning, so use with care.
+
+        The device type should be determined from the class of the ``device``
+        parameter.
+
+        If the hardware manager has no opinion about the provided device, it
+        must raise IncompatibleHardwareMethodError. Otherwise, it must return
+        the (potentially modified) device to keep it in the listing or None
+        to exclude it.
+
+        The hardware manager must not modify the device if it returns None
+        or raises IncompatibleHardwareMethodError!
+
+        :param device: An object with the device information.
+        :raises: IncompatibleHardwareMethodError to delegate filtering to
+            other hardware managers.
+        :return: The modified device or None to exclude it.
+        """
+        raise errors.IncompatibleHardwareMethodError()
+
 
 class GenericHardwareManager(HardwareManager):
     HARDWARE_MANAGER_NAME = 'generic_hardware_manager'
     # 1.1 - Added new clean step called erase_devices_metadata
-    HARDWARE_MANAGER_VERSION = '1.1'
+    # 1.2 - Added new get_service_steps method
+    HARDWARE_MANAGER_VERSION = '1.2'
 
     def __init__(self):
-        self.sys_path = '/sys'
         self.lldp_data = {}
+        self._lshw_cache = None
 
     def evaluate_hardware_support(self):
-        # Do some initialization before we declare ourself ready
+        return HardwareSupport.GENERIC
+
+    def initialize(self):
         _check_for_iscsi()
         _md_scan_and_assemble()
         _load_ipmi_modules()
@@ -1193,18 +1418,60 @@ class GenericHardwareManager(HardwareManager):
             MULTIPATH_ENABLED = _enable_multipath()
 
         self.wait_for_disks()
-        return HardwareSupport.GENERIC
 
-    def collect_lldp_data(self, interface_names):
+    def list_hardware_info(self):
+        """Return full hardware inventory as a serializable dict.
+
+        This inventory is sent to Ironic on lookup and to Inspector on
+        inspection.
+
+        :returns: a dictionary representing inventory
+        """
+        with self._cached_lshw():
+            return super().list_hardware_info()
+
+    @contextlib.contextmanager
+    def _cached_lshw(self):
+        if self._lshw_cache:
+            yield  # make this context manager reentrant without purging cache
+            return
+
+        self._lshw_cache = self._get_system_lshw_dict()
+        try:
+            yield
+        finally:
+            self._lshw_cache = None
+
+    def _get_system_lshw_dict(self):
+        """Get a dict representation of the system from lshw
+
+        Retrieves a json representation of the system from lshw and converts
+        it to a python dict
+
+        :returns: A python dict from the lshw json output
+        """
+        if self._lshw_cache:
+            return self._lshw_cache
+
+        out, _e = utils.execute('lshw', '-quiet', '-json', log_stdout=False)
+        out = json.loads(out)
+        # Depending on lshw version, output might be a list, starting with
+        # https://github.com/lyonel/lshw/commit/135a853c60582b14c5b67e5cd988a8062d9896f4  # noqa
+        if isinstance(out, list):
+            return out[0]
+        return out
+
+    def collect_lldp_data(self, interface_names=None):
         """Collect and convert LLDP info from the node.
 
         In order to process the LLDP information later, the raw data needs to
         be converted for serialization purposes.
 
         :param interface_names: list of names of node's interfaces.
-        :return: a dict, containing the lldp data from every interface.
+        :returns: a dict, containing the lldp data from every interface.
         """
-
+        if interface_names is None:
+            interface_names = netutils.list_interfaces()
         interface_names = [name for name in interface_names if name != 'lo']
         lldp_data = {}
         try:
@@ -1233,8 +1500,31 @@ class GenericHardwareManager(HardwareManager):
         if self.lldp_data:
             return self.lldp_data.get(interface_name)
 
-    def get_interface_info(self, interface_name):
+    def _get_network_speed(self, interface_name):
+        sys_dict = self._get_system_lshw_dict()
+        try:
+            iface_dict = next(
+                utils.find_in_lshw(sys_dict, by_class='network',
+                                   logicalname=interface_name,
+                                   recursive=True)
+            )
+        except StopIteration:
+            LOG.warning('Cannot find detailed information about interface %s',
+                        interface_name)
+            return None
 
+        # speed is the current speed, capacity is the maximum speed
+        speed = iface_dict.get('capacity') or iface_dict.get('speed')
+        if not speed:
+            LOG.debug('No speed information about in %s', iface_dict)
+            return None
+
+        units = iface_dict.get('units', 'bit_s').replace('/', '_')
+        return int(UNIT_CONVERTER(f'{speed} {units}')
+                   .to(UNIT_CONVERTER.Mbit_s)
+                   .magnitude)
+
+    def get_interface_info(self, interface_name):
         mac_addr = netutils.get_mac_addr(interface_name)
         if mac_addr is None:
             raise errors.IncompatibleHardwareMethodError()
@@ -1246,7 +1536,11 @@ class GenericHardwareManager(HardwareManager):
             has_carrier=netutils.interface_has_carrier(interface_name),
             vendor=_get_device_info(interface_name, 'net', 'vendor'),
             product=_get_device_info(interface_name, 'net', 'device'),
-            biosdevname=self.get_bios_given_nic_name(interface_name))
+            biosdevname=self.get_bios_given_nic_name(interface_name),
+            speed_mbps=self._get_network_speed(interface_name),
+            pci_address=netutils.get_interface_pci_address(interface_name),
+            driver=netutils.get_interface_driver(interface_name)
+        )
 
     def get_ipv4_addr(self, interface_id):
         return netutils.get_ipv4_addr(interface_id)
@@ -1269,18 +1563,18 @@ class GenericHardwareManager(HardwareManager):
         extra field named ``biosdevname``.
 
         :param interface_name: list of names of node's interfaces.
-        :return: the BIOS given NIC name of node's interfaces or default
+        :returns: the BIOS given NIC name of node's interfaces or default
                  as None.
         """
         global WARN_BIOSDEVNAME_NOT_FOUND
 
-        if self._is_vlan(interface_name):
+        if netutils.is_vlan(interface_name):
             LOG.debug('Interface %s is a VLAN, biosdevname not called',
                       interface_name)
             return
 
         try:
-            stdout, _ = il_utils.execute('biosdevname', '-i', interface_name)
+            stdout, _ = utils.execute('biosdevname', '-i', interface_name)
             return stdout.rstrip('\n')
         except OSError:
             if not WARN_BIOSDEVNAME_NOT_FOUND:
@@ -1295,86 +1589,149 @@ class GenericHardwareManager(HardwareManager):
             else:
                 LOG.warning('Biosdevname returned exit code %s', e.exit_code)
 
-    def _is_device(self, interface_name):
-        device_path = '{}/class/net/{}/device'.format(self.sys_path,
-                                                      interface_name)
-        return os.path.exists(device_path)
-
-    def _is_vlan(self, interface_name):
-        # A VLAN interface does not have /device, check naming convention
-        # used when adding VLAN interface
-
-        interface, sep, vlan = interface_name.partition('.')
-
-        return vlan.isdigit()
-
-    def _is_bond(self, interface_name):
-        device_path = '{}/class/net/{}/bonding'.format(self.sys_path,
-                                                       interface_name)
-        return os.path.exists(device_path)
-
     def list_network_interfaces(self):
-        network_interfaces_list = []
-        iface_names = os.listdir('{}/class/net'.format(self.sys_path))
-        iface_names = [name for name in iface_names
-                       if self._is_vlan(name) or self._is_device(name)
-                       or self._is_bond(name)]
+        iface_names = netutils.list_interfaces()
 
         if CONF.collect_lldp:
             self.lldp_data = dispatch_to_managers('collect_lldp_data',
                                                   interface_names=iface_names)
 
-        for iface_name in iface_names:
-            try:
-                result = dispatch_to_managers(
-                    'get_interface_info', interface_name=iface_name)
-            except errors.HardwareManagerMethodNotFound:
-                LOG.warning('No hardware manager was able to handle '
-                            'interface %s', iface_name)
-                continue
-            result.lldp = self._get_lldp_data(iface_name)
-            network_interfaces_list.append(result)
-
-        # If configured, bring up vlan interfaces. If the actual vlans aren't
-        # defined they are derived from LLDP data
-        if CONF.enable_vlan_interfaces:
-            vlan_iface_names = netutils.bring_up_vlan_interfaces(
-                network_interfaces_list)
-            for vlan_iface_name in vlan_iface_names:
-                result = dispatch_to_managers(
-                    'get_interface_info', interface_name=vlan_iface_name)
+        network_interfaces_list = []
+        with self._cached_lshw():
+            for iface_name in iface_names:
+                try:
+                    result = dispatch_to_managers(
+                        'get_interface_info', interface_name=iface_name)
+                except errors.HardwareManagerMethodNotFound:
+                    LOG.warning('No hardware manager was able to handle '
+                                'interface %s', iface_name)
+                    continue
+                result.lldp = self._get_lldp_data(iface_name)
                 network_interfaces_list.append(result)
 
-        return network_interfaces_list
+            # If configured, bring up vlan interfaces. If the actual vlans
+            # aren't defined they are derived from LLDP data
+            if CONF.enable_vlan_interfaces:
+                vlan_iface_names = netutils.bring_up_vlan_interfaces(
+                    network_interfaces_list)
+                for vlan_iface_name in vlan_iface_names:
+                    result = dispatch_to_managers(
+                        'get_interface_info', interface_name=vlan_iface_name)
+                    network_interfaces_list.append(result)
 
-    def get_cpus(self):
-        lines = il_utils.execute('lscpu')[0]
+        return filter_devices(network_interfaces_list)
+
+    def any_ipmi_device_exists(self):
+        '''Check for an IPMI device to confirm IPMI capability.'''
+        for pattern in ['/dev/ipmi*', '/dev/ipmi/*', '/dev/ipmidev/*']:
+            ipmi_files = glob.glob(pattern)
+            for device in ipmi_files:
+                if utils.is_char_device(device):
+                    return True
+        return False
+
+    @staticmethod
+    def create_cpu_info_dict(lines):
         cpu_info = {k.strip().lower(): v.strip() for k, v in
                     (line.split(':', 1)
-                     for line in lines.split('\n')
-                     if line.strip())}
-        # Current CPU frequency can be different from maximum one on modern
-        # processors
-        freq = cpu_info.get('cpu max mhz', cpu_info.get('cpu mhz'))
+                    for line in lines.split('\n')
+                    if line.strip())}
 
-        flags = []
-        out = il_utils.try_execute('grep', '-Em1', '^flags', '/proc/cpuinfo')
-        if out:
-            try:
-                # Example output (much longer for a real system):
-                # flags           : fpu vme de pse
-                flags = out[0].strip().split(':', 1)[1].strip().split()
-            except (IndexError, ValueError):
-                LOG.warning('Malformed CPU flags information: %s', out)
-        else:
-            LOG.warning('Failed to get CPU flags')
+        return cpu_info
 
-        return CPU(model_name=cpu_info.get('model name'),
-                   frequency=freq,
-                   # this includes hyperthreading cores
-                   count=int(cpu_info.get('cpu(s)')),
-                   architecture=cpu_info.get('architecture'),
-                   flags=flags)
+    def read_cpu_info(self):
+        sections = []
+
+        try:
+            with open('/proc/cpuinfo', 'r') as file:
+                file_contents = file.read()
+
+            # Replace tabs with nothing (essentially removing them)
+            file_contents = file_contents.replace("\t", "")
+
+            # Split the string into a list of CPU core entries
+            # Each core's info is separated by a double newline
+            sections = file_contents.split("\n\n")[:-1]
+
+        except (FileNotFoundError, errors.InspectionError, OSError) as e:
+            LOG.warning(
+                'Failed to get CPU information from /proc/cpuinfo: %s', e
+            )
+
+        return sections
+
+    def get_cpu_cores(self):
+        cpu_info_dicts = []
+
+        sections = self.read_cpu_info()
+
+        for lines in sections:
+            cpu_info = self.create_cpu_info_dict(lines)
+
+            if cpu_info is not None:
+                cpu_info_dicts.append(cpu_info)
+
+        if len(cpu_info_dicts) == 0:
+            LOG.warning(
+                'No per-core CPU information found'
+            )
+
+        cpus = []
+        for cpu_info in cpu_info_dicts:
+            cpu = CPUCore(
+                model_name=cpu_info.get('model name', ''),
+                frequency=cpu_info.get('cpu mhz', ''),
+                architecture=cpu_info.get('architecture', ''),
+                core_id=cpu_info.get('core id', ''),
+                flags=cpu_info.get('flags', '').split()
+            )
+            cpus.append(cpu)
+
+        return cpus
+
+    def get_cpus(self):
+        lines = utils.execute('lscpu')[0]
+        cpu_info = self.create_cpu_info_dict(lines)
+
+        # NOTE(adamcarthur) Kept this assuming it was added as a fallback
+        # for systems where lscpu does not show flags.
+        if not cpu_info.get("flags", None):
+
+            sections = self.read_cpu_info()
+            if len(sections) == 0:
+                cpu_info['flags'] = ""
+            else:
+                cpu_info_proc = self.create_cpu_info_dict(sections[0])
+
+                flags = cpu_info_proc.get('flags', "")
+
+                # NOTE(adamcarthur) This is only a basic check to
+                # check the flags look correct
+                if flags and re.search(r'[A-Z!@#$%^&*()_+{}|:"<>?]', flags):
+                    LOG.warning('Malformed CPU flags information: %s', flags)
+                    cpu_info['flags'] = ""
+                else:
+                    cpu_info['flags'] = flags
+
+        if cpu_info["flags"] == "":
+            LOG.warning(
+                'No CPU flags found'
+            )
+
+        return CPU(
+            model_name=cpu_info.get('model name', ''),
+            # NOTE(adamcarthur) Current CPU frequency can
+            # be different from maximum one on modern processors
+            frequency=cpu_info.get(
+                'cpu max mhz',
+                cpu_info.get('cpu mhz', "")
+            ),
+            count=int(cpu_info.get('cpu(s)', 0)),
+            architecture=cpu_info.get('architecture', ''),
+            flags=cpu_info.get('flags', '').split(),
+            socket_count=int(cpu_info.get('socket(s)', 0)),
+            cpus=self.get_cpu_cores()
+        )
 
     def get_memory(self):
         # psutil returns a long, so we force it to an int
@@ -1388,7 +1745,7 @@ class GenericHardwareManager(HardwareManager):
             LOG.exception(("Cannot fetch total memory size using psutil "
                            "version %s"), psutil.version_info[0])
         try:
-            sys_dict = _get_system_lshw_dict()
+            sys_dict = self._get_system_lshw_dict()
         except (processutils.ProcessExecutionError, OSError, ValueError) as e:
             LOG.warning('Could not get real physical RAM from lshw: %s', e)
             physical = None
@@ -1400,24 +1757,23 @@ class GenericHardwareManager(HardwareManager):
 
         return Memory(total=total, physical_mb=physical)
 
-    def list_block_devices(self, include_partitions=False):
-        block_devices = list_all_block_devices()
+    def list_block_devices(self, include_partitions=False,
+                           all_serial_and_wwn=False):
+        block_devices = \
+            list_all_block_devices(all_serial_and_wwn=all_serial_and_wwn)
         if include_partitions:
             block_devices.extend(
                 list_all_block_devices(block_type='part',
                                        ignore_raid=True)
             )
-        return block_devices
+        return filter_devices(block_devices)
 
-    def get_skip_list_from_node(self, node,
-                                block_devices=None, just_raids=False):
+    def get_skip_list_from_node_for_disks(self, node,
+                                          block_devices=None):
         properties = node.get('properties', {})
         skip_list_hints = properties.get("skip_block_devices", [])
         if not skip_list_hints:
             return None
-        if just_raids:
-            return {d['volume_name'] for d in skip_list_hints
-                    if 'volume_name' in d}
         if not block_devices:
             return None
         skip_list = set()
@@ -1425,7 +1781,8 @@ class GenericHardwareManager(HardwareManager):
         for hint in skip_list_hints:
             if 'volume_name' in hint:
                 continue
-            found_devs = il_utils.find_devices_by_hints(serialized_devs, hint)
+            found_devs = device_hints.find_devices_by_hints(serialized_devs,
+                                                            hint)
             excluded_devs = {dev['name'] for dev in found_devs}
             skipped_devices = excluded_devs.difference(skip_list)
             skip_list = skip_list.union(excluded_devs)
@@ -1434,15 +1791,50 @@ class GenericHardwareManager(HardwareManager):
                             {'hint': hint, 'devs': ','.join(skipped_devices)})
         return skip_list
 
+    def get_skip_list_from_node_for_raids(self, node):
+        properties = node.get('properties', {})
+        skip_list_hints = properties.get("skip_block_devices", [])
+        if not skip_list_hints:
+            return None
+        raid_skip_list = {d['volume_name'] for d in skip_list_hints
+                          if 'volume_name' in d}
+        if len(raid_skip_list) == 0:
+            return None
+        else:
+            return raid_skip_list
+
     def list_block_devices_check_skip_list(self, node,
-                                           include_partitions=False):
+                                           include_partitions=False,
+                                           all_serial_and_wwn=False,
+                                           include_wipe=False):
         block_devices = self.list_block_devices(
-            include_partitions=include_partitions)
-        skip_list = self.get_skip_list_from_node(
+            include_partitions=include_partitions,
+            all_serial_and_wwn=all_serial_and_wwn)
+        skip_list = self.get_skip_list_from_node_for_disks(
             node, block_devices)
         if skip_list is not None:
             block_devices = [d for d in block_devices
                              if d.name not in skip_list]
+        # Note(kubajj): match volume_names to raid_device names
+        raid_skip_list = self.get_skip_list_from_node_for_raids(node)
+        if raid_skip_list is not None:
+            # Find all raid devices and remove anyone with 'keep'
+            # (and 'wipe' if include_wipe is true)
+            raid_devices = list_all_block_devices(block_type=['raid', 'md'],
+                                                  ignore_raid=False,
+                                                  ignore_empty=False)
+            raid_skip_list_dict = self._handle_raid_skip_list(raid_devices,
+                                                              raid_skip_list)
+            delete_raid_devices = raid_skip_list_dict['delete_raid_devices']
+            block_devices = [
+                rd for rd in block_devices
+                if delete_raid_devices.get(rd.name) != 'keep'
+            ]
+            if include_wipe:
+                block_devices = [
+                    rd for rd in block_devices
+                    if delete_raid_devices.get(rd.name) != 'wipe'
+                ]
         return block_devices
 
     def get_os_install_device(self, permit_refresh=False):
@@ -1460,16 +1852,16 @@ class GenericHardwareManager(HardwareManager):
             LOG.debug('Looking for a device matching root hints %s',
                       root_device_hints)
             block_devices = self.list_block_devices_check_skip_list(
-                cached_node)
+                cached_node, all_serial_and_wwn=True)
         else:
-            block_devices = self.list_block_devices()
+            block_devices = self.list_block_devices(all_serial_and_wwn=True)
         if not root_device_hints:
             dev_name = utils.guess_root_disk(block_devices).name
         else:
             serialized_devs = [dev.serialize() for dev in block_devices]
             try:
-                device = il_utils.match_root_device_hints(serialized_devs,
-                                                          root_device_hints)
+                device = device_hints.match_root_device_hints(
+                    serialized_devs, root_device_hints)
             except ValueError as e:
                 # NOTE(lucasagomes): Just playing on the safe side
                 # here, this exception should never be raised because
@@ -1493,15 +1885,40 @@ class GenericHardwareManager(HardwareManager):
                   'node': cached_node['uuid'] if cached_node else None})
         return dev_name
 
+    def get_usb_devices(self):
+        sys_dict = self._get_system_lshw_dict()
+        try:
+            usb_dict = utils.find_in_lshw(sys_dict, by_id='usb',
+                                          by_class='generic', recursive=True)
+
+        except StopIteration:
+            LOG.warning('Cannot find detailed information about USB')
+            return None
+        devices = []
+        for dev in usb_dict:
+            usb_info = USBInfo(product=dev.get('product', ''),
+                               vendor=dev.get('vendor', ''),
+                               handle=dev.get('handle', ''))
+            devices.append(usb_info)
+        return filter_devices(devices)
+
     def get_system_vendor_info(self):
         try:
-            sys_dict = _get_system_lshw_dict()
+            sys_dict = self._get_system_lshw_dict()
         except (processutils.ProcessExecutionError, OSError, ValueError) as e:
             LOG.warning('Could not retrieve vendor info from lshw: %s', e)
             sys_dict = {}
+
+        core_dict = next(utils.find_in_lshw(sys_dict, 'core'), {})
+        fw_dict = next(utils.find_in_lshw(core_dict, 'firmware'), {})
+
+        firmware = SystemFirmware(vendor=fw_dict.get('vendor', ''),
+                                  version=fw_dict.get('version', ''),
+                                  build_date=fw_dict.get('date', ''))
         return SystemVendorInfo(product_name=sys_dict.get('product', ''),
                                 serial_number=sys_dict.get('serial', ''),
-                                manufacturer=sys_dict.get('vendor', ''))
+                                manufacturer=sys_dict.get('vendor', ''),
+                                firmware=firmware)
 
     def get_boot_info(self):
         boot_mode = 'uefi' if os.path.isdir('/sys/firmware/efi') else 'bios'
@@ -1586,7 +2003,7 @@ class GenericHardwareManager(HardwareManager):
 
     def _list_erasable_devices(self, node):
         block_devices = self.list_block_devices_check_skip_list(
-            node, include_partitions=True)
+            node, include_partitions=True, include_wipe=True)
         # NOTE(coreywright): Reverse sort by device name so a partition (eg
         # sda1) is processed before it disappears when its associated disk (eg
         # sda) has its partition table erased and the kernel notified.
@@ -1616,7 +2033,7 @@ class GenericHardwareManager(HardwareManager):
         :param ports: list of Ironic port objects
         :raises BlockDeviceEraseError: when there's an error erasing the
                 block device
-        :raises: ProtectedDeviceFound if a device has been identified which
+        :raises: ProtectedDeviceError if a device has been identified which
                  may require manual intervention due to the contents and
                  operational risk which exists as it could also be a sign
                  of an environmental misconfiguration.
@@ -1647,18 +2064,20 @@ class GenericHardwareManager(HardwareManager):
         :param ports: list of Ironic port objects
         :raises BlockDeviceEraseError: when there's an error erasing the
                 block device
-        :raises: ProtectedDeviceFound if a device has been identified which
+        :raises: ProtectedDeviceError if a device has been identified which
                  may require manual intervention due to the contents and
                  operational risk which exists as it could also be a sign
                  of an environmental misconfiguration.
         """
         erase_errors = {}
         info = node.get('driver_internal_info', {})
-        if not self._list_erasable_devices:
+        erasable_devices = self._list_erasable_devices(node)
+        if not erasable_devices:
             LOG.debug("No erasable devices have been found.")
             return
-        for dev in self._list_erasable_devices(node):
+        for dev in erasable_devices:
             safety_check_block_device(node, dev.name)
+            secure_erase_error = None
             try:
                 if self._is_nvme(dev):
                     execute_nvme_erase = info.get(
@@ -1730,6 +2149,14 @@ class GenericHardwareManager(HardwareManager):
         """
         burnin.stress_ng_cpu(node)
 
+    def burnin_gpu(self, node, ports):
+        """Burn-in the GPU
+
+        :param node: Ironic node object
+        :param ports: list of Ironic port objects
+        """
+        burnin.gpu_burn(node)
+
     def burnin_disk(self, node, ports):
         """Burn-in the disk
 
@@ -1771,7 +2198,7 @@ class GenericHardwareManager(HardwareManager):
         args += ('--verbose', '--iterations', str(npasses), block_device.name)
 
         try:
-            il_utils.execute(*args)
+            utils.execute(*args)
         except (processutils.ProcessExecutionError, OSError) as e:
             LOG.error("Erasing block device %(dev)s failed with error %(err)s",
                       {'dev': block_device.name, 'err': e})
@@ -1804,8 +2231,8 @@ class GenericHardwareManager(HardwareManager):
         try:
             # Don't use the '--nodeps' of lsblk to also catch the
             # parent device of partitions which are RAID members.
-            out, _ = il_utils.execute('lsblk', '--fs', '--noheadings',
-                                      block_device.name)
+            out, _ = utils.execute('lsblk', '--fs', '--noheadings',
+                                   block_device.name)
         except processutils.ProcessExecutionError as e:
             LOG.warning("Could not determine if %(name)s is a RAID member: "
                         "%(err)s",
@@ -1846,7 +2273,7 @@ class GenericHardwareManager(HardwareManager):
         return False
 
     def _get_ata_security_lines(self, block_device):
-        output = il_utils.execute('hdparm', '-I', block_device.name)[0]
+        output = utils.execute('hdparm', '-I', block_device.name)[0]
 
         if '\nSecurity: ' not in output:
             return []
@@ -1879,9 +2306,9 @@ class GenericHardwareManager(HardwareManager):
             # instead of `scsi` or `sat` as smartctl will not be able to read
             # a bridged device that it doesn't understand, and accordingly
             # return an error code.
-            output = il_utils.execute('smartctl', '-d', 'ata',
-                                      block_device.name, '-g', 'security',
-                                      check_exit_code=[0, 127])[0]
+            output = utils.execute('smartctl', '-d', 'ata',
+                                   block_device.name, '-g', 'security',
+                                   check_exit_code=[0, 127])[0]
             if 'Unavailable' in output:
                 # Smartctl is reporting it is unavailable, lets return false.
                 LOG.debug('Smartctl has reported that security is '
@@ -1915,9 +2342,9 @@ class GenericHardwareManager(HardwareManager):
                 if 'not locked' in security_lines:
                     break
                 try:
-                    il_utils.execute('hdparm', '--user-master', 'u',
-                                     '--security-unlock', password,
-                                     block_device.name)
+                    utils.execute('hdparm', '--user-master', 'u',
+                                  '--security-unlock', password,
+                                  block_device.name)
                 except processutils.ProcessExecutionError as e:
                     LOG.info('Security unlock failed for device '
                              '%(name)s using password "%(password)s": %(err)s',
@@ -1963,9 +2390,9 @@ class GenericHardwareManager(HardwareManager):
             # SEC1. Try to transition to SEC5 by setting empty user
             # password.
             try:
-                il_utils.execute('hdparm', '--user-master', 'u',
-                                 '--security-set-pass', 'NULL',
-                                 block_device.name)
+                utils.execute('hdparm', '--user-master', 'u',
+                              '--security-set-pass', 'NULL',
+                              block_device.name)
             except processutils.ProcessExecutionError as e:
                 error_msg = ('Security password set failed for device '
                              '{name}: {err}'
@@ -1978,8 +2405,8 @@ class GenericHardwareManager(HardwareManager):
             erase_option += '-enhanced'
 
         try:
-            il_utils.execute('hdparm', '--user-master', 'u', erase_option,
-                             'NULL', block_device.name)
+            utils.execute('hdparm', '--user-master', 'u', erase_option,
+                          'NULL', block_device.name)
         except processutils.ProcessExecutionError as e:
             # NOTE(TheJulia): Attempt unlock to allow fallback to shred
             # to occur, otherwise shred will fail as well, as the security
@@ -2016,7 +2443,7 @@ class GenericHardwareManager(HardwareManager):
         """Attempt to clean the NVMe using the most secure supported method
 
         :param block_device: a BlockDevice object
-        :return: True if cleaning operation succeeded, False if it failed
+        :returns: True if cleaning operation succeeded, False if it failed
         :raises: BlockDeviceEraseError
         """
 
@@ -2024,8 +2451,8 @@ class GenericHardwareManager(HardwareManager):
         try:
             LOG.debug("Attempting to fetch NVMe capabilities for device %s",
                       block_device.name)
-            nvme_info, _e = il_utils.execute('nvme', 'id-ctrl',
-                                             block_device.name, '-o', 'json')
+            nvme_info, _e = utils.execute('nvme', 'id-ctrl',
+                                          block_device.name, '-o', 'json')
             nvme_info = json.loads(nvme_info)
 
         except processutils.ProcessExecutionError as e:
@@ -2067,8 +2494,8 @@ class GenericHardwareManager(HardwareManager):
         try:
             LOG.debug("Attempting to nvme-format %s using secure format mode "
                       "(ses) %s", block_device.name, format_mode)
-            il_utils.execute('nvme', 'format', block_device.name, '-s',
-                             format_mode, '-f')
+            utils.execute('nvme', 'format', block_device.name, '-s',
+                          format_mode, '-f')
             LOG.info("nvme-cli format for device %s (ses= %s ) completed "
                      "successfully.", block_device.name, format_mode)
             return True
@@ -2081,15 +2508,18 @@ class GenericHardwareManager(HardwareManager):
     def get_bmc_address(self):
         """Attempt to detect BMC IP address
 
-        :return: IP address of lan channel or 0.0.0.0 in case none of them is
+        :returns: IP address of lan channel or 0.0.0.0 in case none of them is
                  configured properly
         """
+        if not self.any_ipmi_device_exists():
+            return None
+
         try:
             # From all the channels 0-15, only 1-11 can be assigned to
             # different types of communication media and protocols and
             # effectively used
             for channel in range(1, 12):
-                out, e = il_utils.execute(
+                out, e = utils.execute(
                     "ipmitool lan print {} | awk '/IP Address[ \\t]*:/"
                     " {{print $4}}'".format(channel), shell=True)
                 if e.startswith("Invalid channel"):
@@ -2118,15 +2548,19 @@ class GenericHardwareManager(HardwareManager):
     def get_bmc_mac(self):
         """Attempt to detect BMC MAC address
 
-        :return: MAC address of the first LAN channel or 00:00:00:00:00:00 in
+        :returns: MAC address of the first LAN channel or 00:00:00:00:00:00 in
                  case none of them has one or is configured properly
+        :raises: IncompatibleHardwareMethodError if no valid mac is found.
         """
+        if not self.any_ipmi_device_exists():
+            return None
+
         try:
             # From all the channels 0-15, only 1-11 can be assigned to
             # different types of communication media and protocols and
             # effectively used
             for channel in range(1, 12):
-                out, e = il_utils.execute(
+                out, e = utils.execute(
                     "ipmitool lan print {} | awk '/(IP|MAC) Address[ \\t]*:/"
                     " {{print $4}}'".format(channel), shell=True)
                 if e.startswith("Invalid channel"):
@@ -2140,8 +2574,34 @@ class GenericHardwareManager(HardwareManager):
                     continue
 
                 if ip == "0.0.0.0":
-                    # disabled, ignore
-                    continue
+                    # Check if we have IPv6 address configured
+                    out, e = utils.execute(
+                        "ipmitool lan6 print {} | awk '/^IPv6"
+                        " (Dynamic|Static) Address [0-9]+:/"
+                        " {{in_section=1; next}} /^IPv6 / {{in_section=0}}"
+                        " in_section && /Address:/ {{print $2}}'".
+                        format(channel), shell=True)
+                    if e.startswith("Invalid channel"):
+                        continue
+
+                    valid_ipv6_found = False
+                    try:
+                        ipv6_list = out.strip().split("\n")
+                        # Skip auto-configured link-local addresses
+                        # and ignore "::/255", which indicates unconfigured
+                        # addresses returned by ipmitool.
+                        valid_ipv6_found = any(
+                            not ipv6.startswith("::")
+                            and not ipv6.startswith("fe80")
+                            for ipv6 in ipv6_list
+                        )
+                    except ValueError:
+                        LOG.warning('Invalid ipmitool output %(output)s',
+                                    {'output': out})
+                        continue
+
+                    if not valid_ipv6_found:
+                        continue
 
                 if not re.match("^[0-9a-f]{2}(:[0-9a-f]{2}){5}$", mac, re.I):
                     LOG.warning('Invalid MAC address %(output)s',
@@ -2164,17 +2624,20 @@ class GenericHardwareManager(HardwareManager):
     def get_bmc_v6address(self):
         """Attempt to detect BMC v6 address
 
-        :return: IPv6 address of lan channel or ::/0 in case none of them is
+        :returns: IPv6 address of lan channel or ::/0 in case none of them is
                  configured properly. May return None value if it cannot
-                 interract with system tools or critical error occurs.
+                 interact with system tools or critical error occurs.
         """
+        if not self.any_ipmi_device_exists():
+            return None
+
         null_address_re = re.compile(r'^::(/\d{1,3})*$')
 
         def get_addr(channel, dynamic=False):
             cmd = "ipmitool lan6 print {} {}_addr".format(
                 channel, 'dynamic' if dynamic else 'static')
             try:
-                out, exc = il_utils.execute(cmd, shell=True)
+                out, exc = utils.execute(cmd, shell=True)
             except processutils.ProcessExecutionError:
                 return
 
@@ -2183,9 +2646,9 @@ class GenericHardwareManager(HardwareManager):
             #       dynamic_addr and static_addr commands is a valid yaml.
             try:
                 out = yaml.safe_load(out.strip())
-            except yaml.YAMLError as excpt:
+            except yaml.YAMLError as ex:
                 LOG.warning('Cannot process output of "%(cmd)s" '
-                            'command: %(e)s', {'cmd': cmd, 'e': excpt})
+                            'command: %(e)s', {'cmd': cmd, 'e': ex})
                 return
 
             for addr_dict in out.values():
@@ -2204,7 +2667,7 @@ class GenericHardwareManager(HardwareManager):
             # different types of communication media and protocols and
             # effectively used
             for channel in range(1, 12):
-                addr_mode, e = il_utils.execute(
+                addr_mode, e = utils.execute(
                     r"ipmitool lan6 print {} enables | "
                     r"awk '/IPv6\/IPv4 Addressing Enables[ \t]*:/"
                     r"{{print $NF}}'".format(channel), shell=True)
@@ -2259,6 +2722,14 @@ class GenericHardwareManager(HardwareManager):
                 'abortable': True
             },
             {
+                'step': 'clean_uefi_nvram',
+                'priority': 0,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'abortable': True,
+                'argsinfo': DEPLOY_CLEAN_UEFI_NVRAM_ARGSINFO,
+            },
+            {
                 'step': 'delete_configuration',
                 'priority': 0,
                 'interface': 'raid',
@@ -2274,6 +2745,13 @@ class GenericHardwareManager(HardwareManager):
             },
             {
                 'step': 'burnin_cpu',
+                'priority': 0,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'abortable': True
+            },
+            {
+                'step': 'burnin_gpu',
                 'priority': 0,
                 'interface': 'deploy',
                 'reboot_requested': False,
@@ -2318,6 +2796,13 @@ class GenericHardwareManager(HardwareManager):
                 'argsinfo': RAID_APPLY_CONFIGURATION_ARGSINFO,
             },
             {
+                'step': 'clean_uefi_nvram',
+                'priority': 0,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'argsinfo': DEPLOY_CLEAN_UEFI_NVRAM_ARGSINFO,
+            },
+            {
                 'step': 'write_image',
                 # NOTE(dtantsur): this step has to be proxied via an
                 # out-of-band step with the same name, hence the priority here
@@ -2333,7 +2818,131 @@ class GenericHardwareManager(HardwareManager):
                 'reboot_requested': False,
                 'argsinfo': inject_files.ARGSINFO,
             },
+            {
+                'step': 'execute_bootc_install',
+                # NOTE(TheJulia): Similar to write_image above, this step
+                # has to be called directly by a driver to represent the
+                # flow, hence no priority here and realistically it also
+                # doesn't really matter.
+                'priority': 0,
+                'interface': 'deploy',
+                'reboot_requested': False,
+            },
         ]
+
+    # TODO(TheJulia): There has to be a better way, we should
+    # make this less copy paste. That being said, I can also see
+    # unique priorities being needed.
+    def get_service_steps(self, node, ports):
+        service_steps = [
+            {
+                'step': 'delete_configuration',
+                'priority': 0,
+                'interface': 'raid',
+                'reboot_requested': False,
+                'abortable': True
+            },
+            {
+                'step': 'apply_configuration',
+                'priority': 0,
+                'interface': 'raid',
+                'reboot_requested': False,
+                'argsinfo': RAID_APPLY_CONFIGURATION_ARGSINFO,
+            },
+            {
+                'step': 'create_configuration',
+                'priority': 0,
+                'interface': 'raid',
+                'reboot_requested': False,
+                'abortable': True
+            },
+            {
+                'step': 'burnin_cpu',
+                'priority': 0,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'abortable': True
+            },
+            {
+                'step': 'burnin_gpu',
+                'priority': 0,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'abortable': True
+            },
+            # NOTE(TheJulia): Burnin disk is explicitly not carried in this
+            # list because it would be destructive to data on a disk.
+            # If someone needs to do that, the machine should be
+            # unprovisioned.
+            {
+                'step': 'burnin_memory',
+                'priority': 0,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'abortable': True
+            },
+            {
+                'step': 'burnin_network',
+                'priority': 0,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'abortable': True
+            },
+            {
+                'step': 'write_image',
+                # NOTE(dtantsur): this step has to be proxied via an
+                # out-of-band step with the same name, hence the priority here
+                # doesn't really matter.
+                'priority': 0,
+                'interface': 'deploy',
+                'reboot_requested': False,
+            },
+            {
+                'step': 'inject_files',
+                'priority': CONF.inject_files_priority,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'argsinfo': inject_files.ARGSINFO,
+            },
+            {
+                'step': 'execute_bootc_install',
+                # NOTE(TheJulia): Similar to write_image above, this step
+                # has to be called directly by a driver to represent the
+                # flow, hence no priority here and realistically it also
+                # doesn't really matter.
+                'priority': 0,
+                'interface': 'deploy',
+                'reboot_requested': False,
+            },
+        ]
+        # TODO(TheJulia): Consider erase_devices and friends...
+        return service_steps
+
+    def clean_uefi_nvram(self, node, ports, match_patterns=None):
+        """Clean UEFI NVRAM entries.
+
+        :param node: A dictionary of the node object.
+        :param ports: A list of dictionaries containing information
+                      of ports for the node.
+        :param match_patterns: A list of string regular expression patterns
+                               where any matching entry will be deleted.
+        """
+        if match_patterns is None:
+            match_patterns = DEFAULT_CLEAN_UEFI_NVRAM_MATCH_PATTERNS
+        validation_error = ('The match_patterns must be a list of strings: '
+                            '{}').format(match_patterns)
+        if type(match_patterns) is not list:
+            raise errors.InvalidCommandParamsError(validation_error)
+        patterns = []
+        for item in match_patterns:
+            if not isinstance(item, str):
+                raise errors.InvalidCommandParamsError(validation_error)
+            try:
+                patterns.append(re.compile(item, flags=re.IGNORECASE))
+            except re.error:
+                raise errors.InvalidCommandParamsError(validation_error)
+
+        return efi_utils.clean_boot_records(patterns=patterns)
 
     def apply_configuration(self, node, ports, raid_config,
                             delete_existing=True):
@@ -2349,6 +2958,128 @@ class GenericHardwareManager(HardwareManager):
         if delete_existing:
             self.delete_configuration(node, ports)
         return self._do_create_configuration(node, ports, raid_config)
+
+    def _handle_raid_skip_list(self, raid_devices, skip_list):
+        '''Handle the RAID skip list
+
+        This function analyzes the existing RAID devices and the provided
+        skip list to determine which RAID devices should be deleted, wiped,
+        or kept.
+
+        :param raid_devices: A list of BlockDevice objects representing
+                             existing RAID devices
+        :param skip_list: A list of volume names to skip
+        :returns: A dictionary with three keys:
+                    - 'delete_raid_devices': A dictionary mapping RAID device
+                       names to actions ('delete', 'wipe', 'keep')
+                    - 'volume_name_of_raid_devices': A dictionary mapping
+                       RAID device names to their volume names
+                    - 'cause_of_not_deleting': A dictionary mapping RAID
+                       device names to the volume names of RAID devices
+                       that caused them to be kept
+        '''
+        # NOTE(kubajj):
+        # Options in the dictionary delete_raid_devices:
+        # 1. Delete both superblock and data - delete
+        # 2. Keep superblock and wipe data - wipe
+        # 3. Do not touch RAID array - keep
+        delete_raid_devices = {}
+
+        volume_name_of_raid_devices = {}
+        cause_of_not_deleting = {}
+
+        raid_devices_on_holder_disks = {}
+        volume_name_on_skip_list = {}
+        esp_part = None
+        for raid_device in raid_devices:
+            delete_raid_devices[raid_device.name] = 'delete'
+            esp_part = self._analyze_raid_device(raid_device, skip_list,
+                                                 raid_devices_on_holder_disks,
+                                                 volume_name_on_skip_list,
+                                                 volume_name_of_raid_devices)
+        for raid_device in raid_devices:
+            if volume_name_on_skip_list.get(raid_device.name):
+                self._handle_raids_with_volume_name_on_skip_list(
+                    raid_device.name, delete_raid_devices,
+                    cause_of_not_deleting, raid_devices_on_holder_disks,
+                    volume_name_of_raid_devices)
+        # NOTE(kubajj): If ESP partition was supposed to be wiped,
+        # we keep it so that it can be found by raid_utils.find_esp_raid
+        if esp_part is not None and \
+                delete_raid_devices.get(esp_part) == 'wipe':
+            delete_raid_devices[esp_part] = 'keep'
+        return {'delete_raid_devices': delete_raid_devices,
+                'volume_name_of_raid_devices': volume_name_of_raid_devices,
+                'cause_of_not_deleting': cause_of_not_deleting}
+
+    def _analyze_raid_device(self, raid_device, skip_list,
+                             raid_devices_on_holder_disks,
+                             volume_name_on_skip_list,
+                             volume_name_of_raid_devices):
+        '''Analyze a RAID device
+
+        This function figures out which holder disks a RAID device is on,
+        checks if its volume name is on the skip list, and checks whether
+        it is an ESP partition - in which case it returns its name.
+        It also updates the provided dictionaries with information about
+        the RAID device.
+
+        :param raid_device: A BlockDevice object representing a RAID device
+        :param skip_list: A list of volume names to skip
+        :param raid_devices_on_holder_disks: A dictionary mapping holder disks
+                to lists of RAID devices on them
+        :param volume_name_on_skip_list: A dictionary mapping RAID device names
+                to booleans indicating whether their volume name is on the skip
+                list
+        :param volume_name_of_raid_devices: A dictionary mapping RAID device
+                names to their volume names
+        :returns: The name of the ESP partition if the RAID device is an ESP
+                  partition, None otherwise
+        '''
+        esp_part = None
+        holder_disks = get_holder_disks(raid_device.name)
+        for holder_disk in holder_disks:
+            if raid_devices_on_holder_disks.get(holder_disk):
+                raid_devices_on_holder_disks.get(holder_disk).append(
+                    raid_device.name)
+            else:
+                raid_devices_on_holder_disks[holder_disk] = [
+                    raid_device.name]
+        volume_name = raid_utils.get_volume_name_of_raid_device(
+            raid_device.name)
+        if volume_name == 'esp':
+            esp_part = raid_device.name
+        volume_name_of_raid_devices[raid_device.name] = volume_name
+        if volume_name:
+            LOG.info("Software RAID device %(dev)s has volume name "
+                     "%(name)s", {'dev': raid_device.name,
+                                  'name': volume_name})
+            if volume_name in skip_list:
+                LOG.warning("RAID device %s will not be deleted",
+                            raid_device.name)
+                volume_name_on_skip_list[raid_device.name] = True
+            else:
+                volume_name_on_skip_list[raid_device.name] = False
+        return esp_part
+
+    def _handle_raids_with_volume_name_on_skip_list(
+            self, raid_device_name, delete_raid_devices,
+            cause_of_not_deleting, raid_devices_on_holder_disks,
+            volume_name_of_raid_devices):
+        # NOTE(kubajj): Keep this raid_device
+        # wipe all other RAID arrays on these holder disks
+        # unless they have 'keep' already
+        delete_raid_devices[raid_device_name] = 'keep'
+        holder_disks = get_holder_disks(raid_device_name)
+        for holder_disk in holder_disks:
+            for neighbour_raid_device in raid_devices_on_holder_disks[
+                    holder_disk]:
+                if not neighbour_raid_device == raid_device_name and \
+                        delete_raid_devices[neighbour_raid_device] \
+                        == 'delete':
+                    delete_raid_devices[neighbour_raid_device] = 'wipe'
+                    cause_of_not_deleting[neighbour_raid_device] = \
+                        volume_name_of_raid_devices[raid_device_name]
 
     def create_configuration(self, node, ports):
         """Create a RAID configuration.
@@ -2373,30 +3104,103 @@ class GenericHardwareManager(HardwareManager):
         return self._do_create_configuration(node, ports, raid_config)
 
     def _do_create_configuration(self, node, ports, raid_config):
-        def _get_volume_names_of_existing_raids():
-            list_of_raids = []
-            raid_devices = list_all_block_devices(block_type='raid',
+        def _create_raid_ignore_list(logical_disks, skip_list):
+            """Create list of RAID devices to ignore during creation.
+
+            Creates a list of RAID devices to ignore when trying to create a
+            the target raid config. This list includes RAIDs that are left
+            over due to safeguards (skip_block_devices) as well as others
+            which are affected by it.
+
+            :param logical_disks: A list of logical disks from the target RAID
+                    config.
+            :returns: The list of RAID devices to ignore during creation of
+                    the target RAID config.
+            :raises: SoftwareRAIDError if the desired configuration is not
+                    valid or if there was an error when creating the RAID
+                    devices.
+            """
+            raid_devices = list_all_block_devices(block_type=['raid', 'md'],
                                                   ignore_raid=False,
                                                   ignore_empty=False)
-            raid_devices.extend(
-                list_all_block_devices(block_type='md',
-                                       ignore_raid=False,
-                                       ignore_empty=False)
-            )
-            for raid_device in raid_devices:
-                device = raid_device.name
-                try:
-                    il_utils.execute('mdadm', '--examine',
-                                     device, use_standard_locale=True)
-                except processutils.ProcessExecutionError as e:
-                    if "No md superblock detected" in str(e):
-                        continue
-                volume_name = raid_utils.get_volume_name_of_raid_device(device)
-                if volume_name:
-                    list_of_raids.append(volume_name)
-                else:
-                    list_of_raids.append("unnamed_raid")
-            return list_of_raids
+
+            if not raid_devices:
+                # Escape the function if no RAID devices are present
+                return []
+
+            raid_skip_list_dict = self._handle_raid_skip_list(
+                raid_devices, skip_list)
+            delete_raid_devices = raid_skip_list_dict['delete_raid_devices']
+            volume_name_of_raid_devices = raid_skip_list_dict[
+                'volume_name_of_raid_devices']
+            cause_of_not_deleting = raid_skip_list_dict[
+                'cause_of_not_deleting']
+            list_of_raids = [volume_name for volume_name in
+                             volume_name_of_raid_devices.values()]
+            for volume_name in list_of_raids:
+                if volume_name is None or volume_name == '':
+                    msg = ("A Software RAID device detected that does not "
+                           "have a volume name. This is not allowed "
+                           "because there is a volume_name hint in the "
+                           "property 'skip_block_devices'.")
+                    raise errors.SoftwareRAIDError(msg)
+
+            rm_from_list = \
+                _determine_which_logical_disks_should_not_be_created(
+                    logical_disks, skip_list, delete_raid_devices,
+                    volume_name_of_raid_devices, cause_of_not_deleting,
+                    list_of_raids)
+            if 'esp' in list_of_raids:
+                # Note(kubajj): The EFI partition is present after deletion,
+                # therefore, it had to have 'keep' label in delete_raid_devices
+                # as it is on a holder disk with a safeguarded RAID array.
+                rd_name = [rd_name for rd_name, v_name in
+                           volume_name_of_raid_devices.items()
+                           if 'esp' == v_name]
+                if delete_raid_devices[rd_name[0]] == 'keep':
+                    list_of_raids.remove('esp')
+                    LOG.debug("Keeping EFI partition as it is on a holder "
+                              "disk with a safeguarded RAID array %s",
+                              cause_of_not_deleting.get(rd_name[0]))
+            # NOTE(kubajj): Raise an error if there is an existing software
+            # RAID device that either does not have a volume name or does not
+            # match one on the skip list
+            if list_of_raids:
+                msg = ("Existing Software RAID device detected that should"
+                       " not")
+                raise errors.SoftwareRAIDError(msg)
+            return rm_from_list
+
+        def _determine_which_logical_disks_should_not_be_created(
+                logical_disks, skip_list, delete_raid_devices,
+                volume_name_of_raid_devices, cause_of_not_deleting,
+                list_of_raids):
+            rm_from_list = []
+            for ld in logical_disks:
+                volume_name = ld.get('volume_name')
+
+                # Volume name in the list_of_raids
+                if volume_name in list_of_raids:
+                    # Remove LD that are on skip_list
+                    if volume_name in skip_list:
+                        LOG.debug("Software RAID device with volume name %s "
+                                  "exists and is, therefore, not going to be "
+                                  "created", volume_name)
+                    # Remove LD that are on the same disk as skip_list
+                    elif volume_name not in skip_list:
+                        # Fetch raid device using volume name
+                        rd_name = [rd_name for rd_name, v_name in
+                                   volume_name_of_raid_devices.items()
+                                   if volume_name == v_name]
+                        if delete_raid_devices[rd_name[0]] != 'wipe' or \
+                                cause_of_not_deleting.get(rd_name[0]) is None:
+                            msg = ("Existing Software RAID device detected "
+                                   "that should not")
+                            raise errors.SoftwareRAIDError(msg)
+
+                    list_of_raids.remove(volume_name)
+                    rm_from_list.append(ld)
+            return rm_from_list
 
         # No 'software' controller: do nothing. If 'controller' is
         # set to 'software' on only one of the drives, the validation
@@ -2419,29 +3223,12 @@ class GenericHardwareManager(HardwareManager):
 
         # Remove any logical disk from being eligible for inclusion in the
         # RAID if it's on the skip list
-        skip_list = self.get_skip_list_from_node(
-            node, just_raids=True)
+        skip_list = self.get_skip_list_from_node_for_raids(node)
         rm_from_list = []
         if skip_list:
-            present_raids = _get_volume_names_of_existing_raids()
-            if present_raids:
-                for ld in logical_disks:
-                    volume_name = ld.get('volume_name', None)
-                    if volume_name in skip_list \
-                            and volume_name in present_raids:
-                        rm_from_list.append(ld)
-                        LOG.debug("Software RAID device with volume name %s "
-                                  "exists and is, therefore, not going to be "
-                                  "created", volume_name)
-                        present_raids.remove(volume_name)
-            # NOTE(kubajj): Raise an error if there is an existing software
-            # RAID device that either does not have a volume name or does not
-            # match one on the skip list
-            if present_raids:
-                msg = ("Existing Software RAID device detected that should"
-                       " not")
-                raise errors.SoftwareRAIDError(msg)
-        logical_disks = [d for d in logical_disks if d not in rm_from_list]
+            rm_from_list = _create_raid_ignore_list(logical_disks, skip_list)
+
+            logical_disks = [d for d in logical_disks if d not in rm_from_list]
 
         # Log the validated target_raid_configuration.
         LOG.debug("Target Software RAID configuration: %s", raid_config)
@@ -2466,70 +3253,77 @@ class GenericHardwareManager(HardwareManager):
         partition_table_type = utils.get_partition_table_type_from_specs(node)
         target_boot_mode = utils.get_node_boot_mode(node)
 
-        parted_start_dict = raid_utils.create_raid_partition_tables(
-            block_devices, partition_table_type, target_boot_mode)
+        # Only create partitions if some are missing
+        # (this is no longer guaranteed)
+        if block_devices and logical_disks:
+            parted_start_dict = raid_utils.create_raid_partition_tables(
+                block_devices, partition_table_type, target_boot_mode)
 
-        LOG.debug("First available sectors per devices %s", parted_start_dict)
+            LOG.debug("First available sectors per devices %s",
+                      parted_start_dict)
 
-        # Reorder logical disks so that MAX comes last if any:
-        reordered_logical_disks = []
-        max_disk = None
-        for logical_disk in logical_disks:
-            psize = logical_disk['size_gb']
-            if psize == 'MAX':
-                max_disk = logical_disk
-            else:
-                reordered_logical_disks.append(logical_disk)
-        if max_disk:
-            reordered_logical_disks.append(max_disk)
-        logical_disks = reordered_logical_disks
+            # Reorder logical disks so that MAX comes last if any:
+            reordered_logical_disks = []
+            max_disk = None
+            for logical_disk in logical_disks:
+                psize = logical_disk['size_gb']
+                if psize == 'MAX':
+                    max_disk = logical_disk
+                else:
+                    reordered_logical_disks.append(logical_disk)
+            if max_disk:
+                reordered_logical_disks.append(max_disk)
+            logical_disks = reordered_logical_disks
 
-        # With the partitioning below, the first partition is not
-        # exactly the size_gb provided, but rather the size minus a small
-        # amount (often 2048*512B=1MiB, depending on the disk geometry).
-        # Easier to ignore. Another way could be to use sgdisk, which is really
-        # user-friendly to compute part boundaries automatically, instead of
-        # parted, then convert back to mbr table if needed and possible.
+            # With the partitioning below, the first partition is not
+            # exactly the size_gb provided, but rather the size minus a small
+            # amount (often 2048*512B=1MiB, depending on the disk geometry).
+            # Easier to ignore. Another way could be to use sgdisk, which is
+            # really user-friendly to compute part boundaries automatically,
+            # instead of parted, then convert back to mbr table if needed
+            # and possible.
 
-        for logical_disk in logical_disks:
-            # Note: from the doc,
-            # https://docs.openstack.org/ironic/latest/admin/raid.html#target-raid-configuration
-            # size_gb unit is GiB
+            for logical_disk in logical_disks:
+                # Note: from the doc,
+                # https://docs.openstack.org/ironic/latest/admin/raid.html#target-raid-configuration
+                # size_gb unit is GiB
 
-            psize = logical_disk['size_gb']
-            if psize == 'MAX':
-                psize = -1
-            else:
-                psize = int(psize)
+                psize = logical_disk['size_gb']
+                if psize == 'MAX':
+                    psize = -1
+                else:
+                    psize = int(psize)
 
-            # NOTE(dtantsur): populated in get_block_devices_for_raid
-            disk_names = logical_disk['block_devices']
-            for device in disk_names:
-                start = parted_start_dict[device]
-                start_str, end_str, end = (
-                    raid_utils.calc_raid_partition_sectors(psize, start)
-                )
-                try:
-                    LOG.debug("Creating partition on %(dev)s: %(str)s %(end)s",
-                              {'dev': device, 'str': start_str,
-                               'end': end_str})
+                # NOTE(dtantsur): populated in get_block_devices_for_raid
+                disk_names = logical_disk['block_devices']
+                for device in disk_names:
+                    start = parted_start_dict[device]
+                    start_str, end_str, end = (
+                        raid_utils.calc_raid_partition_sectors(psize, start)
+                    )
+                    try:
+                        LOG.debug("Creating partition on %(dev)s: %(str)s "
+                                  "%(end)s", {'dev': device, 'str': start_str,
+                                              'end': end_str})
 
-                    il_utils.execute('parted', device, '-s', '-a',
-                                     'optimal', '--', 'mkpart', 'primary',
-                                     start_str, end_str)
+                        utils.execute('parted', device, '-s', '-a',
+                                      'optimal', '--', 'mkpart', 'primary',
+                                      start_str, end_str)
 
-                except processutils.ProcessExecutionError as e:
-                    msg = "Failed to create partitions on {}: {}".format(
-                        device, e)
-                    raise errors.SoftwareRAIDError(msg)
+                    except processutils.ProcessExecutionError as e:
+                        msg = "Failed to create partitions on {}: {}".format(
+                            device, e)
+                        raise errors.SoftwareRAIDError(msg)
 
-                utils.rescan_device(device)
+                    utils.rescan_device(device)
 
-                parted_start_dict[device] = end
+                    parted_start_dict[device] = end
 
-        # Create the RAID devices.
-        for index, logical_disk in enumerate(logical_disks):
-            raid_utils.create_raid_device(index, logical_disk)
+            # Create the RAID devices. The indices mapping tracks the last used
+            # partition index for each physical device.
+            indices = {}
+            for index, logical_disk in enumerate(logical_disks):
+                raid_utils.create_raid_device(index, logical_disk, indices)
 
         LOG.info("Successfully created Software RAID")
 
@@ -2551,31 +3345,30 @@ class GenericHardwareManager(HardwareManager):
         """
 
         def _scan_raids():
-            il_utils.execute('mdadm', '--assemble', '--scan',
-                             check_exit_code=False)
-            raid_devices = list_all_block_devices(block_type='raid',
+            utils.execute('mdadm', '--assemble', '--scan',
+                          check_exit_code=False)
+            # # NOTE(dszumski): Fetch all devices of type 'md'. This
+            # # will generally contain partitions on a software RAID
+            # # device, but crucially may also contain devices in a
+            # # broken state. See https://review.opendev.org/#/c/670807/
+            # # for more detail.
+            raid_devices = list_all_block_devices(block_type=['raid', 'md'],
                                                   ignore_raid=False,
                                                   ignore_empty=False)
-            # NOTE(dszumski): Fetch all devices of type 'md'. This
-            # will generally contain partitions on a software RAID
-            # device, but crucially may also contain devices in a
-            # broken state. See https://review.opendev.org/#/c/670807/
-            # for more detail.
-            raid_devices.extend(
-                list_all_block_devices(block_type='md',
-                                       ignore_raid=False,
-                                       ignore_empty=False)
-            )
             return raid_devices
 
         raid_devices = _scan_raids()
-        skip_list = self.get_skip_list_from_node(
-            node, just_raids=True)
+        skip_list = self.get_skip_list_from_node_for_raids(
+            node)
         attempts = 0
         while attempts < 2:
             attempts += 1
-            self._delete_config_pass(raid_devices, skip_list)
+            delete_raid_devices = self._delete_config_pass(raid_devices,
+                                                           skip_list)
             raid_devices = _scan_raids()
+            if skip_list:
+                raid_devices = [rd for rd in raid_devices if
+                                delete_raid_devices[rd.name] == 'delete']
             if not raid_devices:
                 break
         else:
@@ -2588,18 +3381,18 @@ class GenericHardwareManager(HardwareManager):
         all_holder_disks = []
         do_not_delete_devices = set()
         delete_partitions = {}
+        delete_raid_devices = {dev.name: 'delete' for dev in raid_devices}
+        volume_name_of_raid_devices = {}
+        cause_of_not_deleting = {}
+        if skip_list:
+            raid_skip_list_dict = self._handle_raid_skip_list(raid_devices,
+                                                              skip_list)
+            delete_raid_devices = raid_skip_list_dict['delete_raid_devices']
+            volume_name_of_raid_devices = raid_skip_list_dict[
+                'volume_name_of_raid_devices']
+            cause_of_not_deleting = raid_skip_list_dict[
+                'cause_of_not_deleting']
         for raid_device in raid_devices:
-            do_not_delete = False
-            volume_name = raid_utils.get_volume_name_of_raid_device(
-                raid_device.name)
-            if volume_name:
-                LOG.info("Software RAID device %(dev)s has volume name"
-                         "%(name)s", {'dev': raid_device.name,
-                                      'name': volume_name})
-                if skip_list and volume_name in skip_list:
-                    LOG.warning("RAID device %s will not be deleted",
-                                raid_device.name)
-                    do_not_delete = True
             component_devices = get_component_devices(raid_device.name)
             if not component_devices:
                 # A "Software RAID device" without components is usually
@@ -2610,74 +3403,101 @@ class GenericHardwareManager(HardwareManager):
                          "partition %s", raid_device.name)
                 continue
             holder_disks = get_holder_disks(raid_device.name)
-
-            if do_not_delete:
-                LOG.warning("Software RAID device %(dev)s is not going to be "
-                            "deleted as its volume name - %(vn)s - is on the "
-                            "skip list", {'dev': raid_device.name,
-                                          'vn': volume_name})
-            else:
-                LOG.info("Deleting Software RAID device %s", raid_device.name)
-            LOG.debug('Found component devices %s', component_devices)
-            LOG.debug('Found holder disks %s', holder_disks)
-
-            if not do_not_delete:
-                # Remove md devices.
-                try:
-                    il_utils.execute('wipefs', '-af', raid_device.name)
-                except processutils.ProcessExecutionError as e:
-                    LOG.warning('Failed to wipefs %(device)s: %(err)s',
-                                {'device': raid_device.name, 'err': e})
-                try:
-                    il_utils.execute('mdadm', '--stop', raid_device.name)
-                except processutils.ProcessExecutionError as e:
-                    LOG.warning('Failed to stop %(device)s: %(err)s',
-                                {'device': raid_device.name, 'err': e})
-
-                # Remove md metadata from component devices.
-                for component_device in component_devices:
-                    try:
-                        il_utils.execute('mdadm', '--examine',
-                                         component_device,
-                                         use_standard_locale=True)
-                    except processutils.ProcessExecutionError as e:
-                        if "No md superblock detected" in str(e):
-                            # actually not a component device
-                            continue
-                        else:
-                            msg = "Failed to examine device {}: {}".format(
-                                  component_device, e)
-                            raise errors.SoftwareRAIDError(msg)
-
-                    LOG.debug('Deleting md superblock on %s', component_device)
-                    try:
-                        il_utils.execute('mdadm', '--zero-superblock',
-                                         component_device)
-                    except processutils.ProcessExecutionError as e:
-                        LOG.warning('Failed to remove superblock from'
-                                    '%(device)s: %(err)s',
-                                    {'device': raid_device.name, 'err': e})
-                    if skip_list:
-                        dev, part = utils.split_device_and_partition_number(
-                            component_device)
-                        if dev in delete_partitions:
-                            delete_partitions[dev].append(part)
-                        else:
-                            delete_partitions[dev] = [part]
-            else:
-                for component_device in component_devices:
-                    do_not_delete_devices.add(component_device)
-
             # NOTE(arne_wiebalck): We cannot delete the partitions right
             # away since there may be other partitions on the same disks
             # which are members of other RAID devices. So we remember them
             # for later.
             all_holder_disks.extend(holder_disks)
-            if do_not_delete:
+            delete_raid_device = delete_raid_devices.get(raid_device.name)
+            if not delete_raid_device == 'delete':
+                for component_device in component_devices:
+                    do_not_delete_devices.add(component_device)
+                if delete_raid_device == 'keep':
+                    volume_name = volume_name_of_raid_devices[raid_device.name]
+                    if volume_name == 'esp':
+                        cause_volume_name = cause_of_not_deleting.get(
+                            raid_device.name)
+                        LOG.warning("EFI RAID device %(dev)s is not going "
+                                    "to be deleted because device %(cvn)s is "
+                                    "on the skip list and is present on the "
+                                    "same holder disk.",
+                                    {'dev': raid_device.name,
+                                     'cvn': cause_volume_name})
+                    else:
+                        LOG.warning("Software RAID device %(dev)s is not "
+                                    "going to be deleted as its volume name "
+                                    "- %(vn)s - is on the skip list",
+                                    {'dev': raid_device.name,
+                                     'vn': volume_name})
+                elif delete_raid_device == 'wipe':
+                    cause_volume_name = cause_of_not_deleting.get(
+                        raid_device.name)
+                    LOG.warning("Software RAID device %(dev)s is not going "
+                                "to be deleted because device %(cvn)s is on "
+                                "the skip list and is present on the same "
+                                "holder disk. The device will be wiped.",
+                                {'dev': raid_device.name,
+                                 'cvn': cause_volume_name})
+                    try:
+                        utils.execute('wipefs', '-af', raid_device.name)
+                    except processutils.ProcessExecutionError as e:
+                        LOG.warning('Failed to wipefs %(device)s: %(err)s',
+                                    {'device': raid_device.name, 'err': e})
+                else:
+                    LOG.warning("Software raid device %(device)s has unknown "
+                                "action %(action)s. Skipping.",
+                                {'device': raid_device.name,
+                                 'action': delete_raid_device})
+
                 LOG.warning("Software RAID device %s was not deleted",
                             raid_device.name)
-            else:
-                LOG.info('Deleted Software RAID device %s', raid_device.name)
+                continue
+
+            LOG.info("Deleting Software RAID device %s", raid_device.name)
+
+            # Remove md devices.
+            try:
+                utils.execute('wipefs', '-af', raid_device.name)
+            except processutils.ProcessExecutionError as e:
+                LOG.warning('Failed to wipefs %(device)s: %(err)s',
+                            {'device': raid_device.name, 'err': e})
+            try:
+                utils.execute('mdadm', '--stop', raid_device.name)
+            except processutils.ProcessExecutionError as e:
+                LOG.warning('Failed to stop %(device)s: %(err)s',
+                            {'device': raid_device.name, 'err': e})
+
+            # Remove md metadata from component devices.
+            for component_device in component_devices:
+                try:
+                    utils.execute('mdadm', '--examine',
+                                  component_device,
+                                  use_standard_locale=True)
+                except processutils.ProcessExecutionError as e:
+                    if "No md superblock detected" in str(e):
+                        # actually not a component device
+                        continue
+                    else:
+                        msg = "Failed to examine device {}: {}".format(
+                            component_device, e)
+                        raise errors.SoftwareRAIDError(msg)
+
+                LOG.debug('Deleting md superblock on %s', component_device)
+                try:
+                    utils.execute('mdadm', '--zero-superblock',
+                                  component_device)
+                except processutils.ProcessExecutionError as e:
+                    LOG.warning('Failed to remove superblock from'
+                                '%(device)s: %(err)s',
+                                {'device': raid_device.name, 'err': e})
+                if skip_list:
+                    dev, part = utils.split_device_and_partition_number(
+                        component_device)
+                    if dev in delete_partitions:
+                        delete_partitions[dev].append(part)
+                    else:
+                        delete_partitions[dev] = [part]
+            LOG.info('Deleted Software RAID device %s', raid_device.name)
 
         # Remove all remaining raid traces from any drives, in case some
         # drives or partitions have been member of some raid once
@@ -2710,8 +3530,8 @@ class GenericHardwareManager(HardwareManager):
             if blk.name in do_not_delete_disks:
                 continue
             try:
-                il_utils.execute('mdadm', '--examine', blk.name,
-                                 use_standard_locale=True)
+                utils.execute('mdadm', '--examine', blk.name,
+                              use_standard_locale=True)
             except processutils.ProcessExecutionError as e:
                 if "No md superblock detected" in str(e):
                     # actually not a component device
@@ -2721,11 +3541,11 @@ class GenericHardwareManager(HardwareManager):
                                 {'name': blk.name, 'err': e})
                     continue
             try:
-                il_utils.execute('mdadm', '--zero-superblock', blk.name)
+                utils.execute('mdadm', '--zero-superblock', blk.name)
             except processutils.ProcessExecutionError as e:
                 LOG.warning('Failed to remove superblock from'
                             '%(device)s: %(err)s',
-                            {'device': raid_device.name, 'err': e})
+                            {'device': blk.name, 'err': e})
 
         # Erase all partition tables we created
         all_holder_disks_uniq = list(
@@ -2733,26 +3553,29 @@ class GenericHardwareManager(HardwareManager):
         for holder_disk in all_holder_disks_uniq:
             if holder_disk in do_not_delete_disks:
                 # Remove just partitions not listed in keep_partitions
-                del_list = delete_partitions[holder_disk]
+                del_list = delete_partitions.get(holder_disk)
                 if del_list:
                     LOG.warning('Holder disk %(dev)s contains logical disk '
                                 'on the skip list. Deleting just partitions: '
                                 '%(parts)s', {'dev': holder_disk,
                                               'parts': del_list})
                     for part in del_list:
-                        il_utils.execute('parted', holder_disk, 'rm', part)
+                        utils.execute('parted', holder_disk, 'rm', part)
                 else:
-                    LOG.warning('Holder disk %(dev)s contains only logical '
+                    LOG.warning('Holder disk %s contains only logical '
                                 'disk(s) on the skip list', holder_disk)
                 continue
             LOG.info('Removing partitions on holder disk %s', holder_disk)
             try:
-                il_utils.execute('wipefs', '-af', holder_disk)
+                utils.execute('wipefs', '-af', holder_disk)
             except processutils.ProcessExecutionError as e:
                 LOG.warning('Failed to remove partitions on %s: %s',
                             holder_disk, e)
 
         LOG.debug("Finished deleting Software RAID(s)")
+
+        # Return dictionary with deletion decisions for RAID devices
+        return delete_raid_devices
 
     def validate_configuration(self, raid_config, node):
         """Validate a (software) RAID configuration
@@ -2782,6 +3605,7 @@ class GenericHardwareManager(HardwareManager):
                    "two logical disks")
             raid_errors.append(msg)
 
+        raid_skip_list = self.get_skip_list_from_node_for_raids(node)
         volume_names = []
         # All disks need to be flagged for Software RAID
         for logical_disk in logical_disks:
@@ -2791,7 +3615,13 @@ class GenericHardwareManager(HardwareManager):
                 raid_errors.append(msg)
 
             volume_name = logical_disk.get('volume_name')
-            if volume_name is not None:
+            if volume_name is None:
+                if raid_skip_list:
+                    msg = ("All logical disks are required to have a volume "
+                           "name specified as a volume name is mentioned in "
+                           "the property skip block devices.")
+                    raid_errors.append(msg)
+            else:
                 if volume_name in volume_names:
                     msg = ("Duplicate software RAID device name %s "
                            "detected" % volume_name)
@@ -2824,6 +3654,8 @@ class GenericHardwareManager(HardwareManager):
             size2 = logical_disks[1]['size_gb']
 
             # Only one logical disk is allowed to span the whole device.
+            # FIXME(dtantsur): this logic is not correct when logical disks use
+            # different physical devices.
             if size1 == 'MAX' and size2 == 'MAX':
                 msg = ("Software RAID can have only one RAID device with "
                        "size 'MAX'")
@@ -2871,6 +3703,33 @@ class GenericHardwareManager(HardwareManager):
         # The result is asynchronous, wait here.
         return cmd.wait()
 
+    def execute_bootc_install(self, node, ports, image_source, configdrive,
+                              oci_pull_secret):
+        """Deploy a container using bootc install.
+
+        Downloads, runs, and leverages bootc install to deploy the desired
+        container to the disk using bootc and writes any configuration
+        drive to the disk if necessary.
+
+        :param node: A dictionary of the node object
+        :param ports: A list of dictionaries containing information
+                      of ports for the node
+        :param image_info: Image information dictionary.
+        :param configdrive: A string containing the location of the config
+                            drive as a URL OR the contents (as gzip/base64)
+                            of the configdrive. Optional, defaults to None.
+        :param oci_pull_secret: The base64 encoded pull secret to utilize
+                                to retrieve the user requested container.
+        """
+        ext = ext_base.get_extension('standby')
+        cmd = ext.execute_bootc_install(
+            image_source=image_source,
+            instance_info=node.get('instance_info'),
+            pull_secret=oci_pull_secret,
+            configdrive=configdrive)
+        # The result is asynchronous, wait here.
+        return cmd.wait()
+
     def generate_tls_certificate(self, ip_address):
         """Generate a TLS certificate for the IP address."""
         return tls_utils.generate_tls_certificate(ip_address)
@@ -2886,47 +3745,161 @@ class GenericHardwareManager(HardwareManager):
         """
         return inject_files.inject_files(node, ports, files, verify_ca)
 
+    def collect_system_logs(self, io_dict, file_list):
+        commands = {
+            'df': ['df', '-a'],
+            'dmesg': ['dmesg'],
+            'efibootmgr': ['efibootmgr', '-v'],
+            'iptables': ['iptables', '-L'],
+            'ip_addr': ['ip', 'addr'],
+            'lsblk': ['lsblk', '--all',
+                      '-o%s' % ','.join(utils.LSBLK_COLUMNS)],
+            'lsblk-full': ['lsblk', '--all', '--bytes',
+                           '--output-all', '--pairs'],
+            'lshw': ['lshw', '-quiet', '-json'],
+            'mdstat': ['cat', '/proc/mdstat'],
+            'mount': ['mount'],
+            'multipath': ['multipath', '-ll'],
+            'parted': ['parted', '-l'],
+            'ps': ['ps', 'au'],
+        }
+        for name, cmd in commands.items():
+            utils.try_collect_command_output(io_dict, name, cmd)
 
-def _compare_extensions(ext1, ext2):
-    mgr1 = ext1.obj
-    mgr2 = ext2.obj
-    return mgr2.evaluate_hardware_support() - mgr1.evaluate_hardware_support()
+        _collect_udev(io_dict)
+
+    def full_sync(self):
+        LOG.debug('Flushing file system buffers')
+        try:
+            utils.execute('sync')
+        except processutils.ProcessExecutionError as e:
+            error_msg = f'Flushing file system buffers failed: {e}'
+            LOG.error(error_msg)
+            # If sync fails, the machine is probably in a bad state and we
+            # better not continue.
+            raise errors.CommandExecutionError(error_msg)
+
+        LOG.debug('Flushing device caches')
+        try:
+            # https://www.kernel.org/doc/Documentation/sysctl/vm.txt
+            with open('/proc/sys/vm/drop_caches', 'wb') as fp:
+                fp.write(b'3')
+        except OSError as e:
+            LOG.warning('Unable to tell the kernel to drop caches: %s', e)
+
+        for blkdev in dispatch_to_managers('list_block_devices'):
+            try:
+                utils.execute('blockdev', '--flushbufs', blkdev.name)
+            except (processutils.ProcessExecutionError, OSError) as e:
+                LOG.warning('Cannot flush buffers of device %s: %s',
+                            blkdev.name, e)
+
+    def filter_device(self, device):
+        """Filter a device in various listings."""
+        return device  # always include, do not modify
+
+
+def _collect_udev(io_dict):
+    """Collect device properties from udev."""
+    try:
+        out, _e = utils.execute('lsblk', '-no', 'KNAME')
+    except processutils.ProcessExecutionError as exc:
+        LOG.warning('Could not list block devices: %s', exc)
+        return
+
+    context = pyudev.Context()
+
+    for kname in out.splitlines():
+        kname = kname.strip()
+        if not kname:
+            continue
+
+        name = os.path.join('/dev', kname)
+
+        try:
+            udev = pyudev.Devices.from_device_file(context, name)
+        except Exception as e:
+            LOG.warning("Device %(dev)s is inaccessible, skipping... "
+                        "Error: %(error)s", {'dev': name, 'error': e})
+            continue
+
+        try:
+            props = dict(udev.properties)
+        except AttributeError:  # pyudev < 0.20
+            props = dict(udev)
+
+        fp = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+        json.dump(props, fp)
+        buf = fp.detach()
+        buf.seek(0)
+        io_dict[f'udev/{kname}'] = buf
+
+
+def _compare_managers(hwm1, hwm2):
+    return hwm2['support'] - hwm1['support']
+
+
+def _get_extensions():
+    return stevedore.ExtensionManager(
+        namespace='ironic_python_agent.hardware_managers',
+        invoke_on_load=True
+    )
 
 
 def get_managers():
     """Get a list of hardware managers in priority order.
 
-    Use stevedore to find all eligible hardware managers, sort them based on
-    self-reported (via evaluate_hardware_support()) priorities, and return them
-    in a list. The resulting list is cached in _global_managers.
+    This exists as a backwards compatibility shim, returning a simple list
+    of managers where expected. New usages should use get_managers_detail.
 
     :returns: Priority-sorted list of hardware managers
+    :raises HardwareManagerNotFound: if no valid hardware managers found
+    """
+    return [hwm['manager'] for hwm in get_managers_detail()]
+
+
+def get_managers_detail():
+    """Get detailed information about hardware managers
+
+    Use stevedore to find all eligible hardware managers, sort them based on
+    self-reported (via evaluate_hardware_support()) priorities, and return a
+    dict containing the manager object, it's class name, and hardware support
+    value. The resulting list is cached in _global_managers.
+
+    :returns: list of dictionaries representing hardware managers and metadata
     :raises HardwareManagerNotFound: if no valid hardware managers found
     """
     global _global_managers
 
     if not _global_managers:
-        extension_manager = stevedore.ExtensionManager(
-            namespace='ironic_python_agent.hardware_managers',
-            invoke_on_load=True)
-
-        # There will always be at least one extension available (the
-        # GenericHardwareManager).
-        extensions = sorted(extension_manager,
-                            key=functools.cmp_to_key(_compare_extensions))
 
         preferred_managers = []
 
-        for extension in extensions:
-            if extension.obj.evaluate_hardware_support() > 0:
-                preferred_managers.append(extension.obj)
+        for extension in _get_extensions():
+            hwm = extension.obj
+            hardware_support = hwm.evaluate_hardware_support()
+            if hardware_support > 0:
+                preferred_managers.append({
+                    'name': hwm.__class__.__name__,
+                    'manager': hwm,
+                    'support': hardware_support
+                })
                 LOG.info('Hardware manager found: %s',
                          extension.entry_point_target)
 
         if not preferred_managers:
             raise errors.HardwareManagerNotFound
 
-        _global_managers = preferred_managers
+        hwms = sorted(preferred_managers,
+                      key=functools.cmp_to_key(_compare_managers))
+
+        _global_managers = hwms
+
+        # NOTE(dtantsur): do not call initialize until all hardware managers
+        # are probed and properly cached!
+        for hwm in hwms:
+            LOG.debug('Initializing hardware manager %s', hwm['name'])
+            hwm['manager'].initialize()
 
     return _global_managers
 
@@ -2992,6 +3965,8 @@ def dispatch_to_managers(method, *args, **kwargs):
     :param kwargs: keyword arguments to dispatched method
 
     :returns: result of successful dispatch of method
+    :raises HardwareManagerConfigurationError: if a hardware manager is
+      misconfigured
     :raises HardwareManagerMethodNotFound: if all managers failed the method
     :raises HardwareManagerNotFound: if no valid hardware managers found
     """
@@ -3000,10 +3975,13 @@ def dispatch_to_managers(method, *args, **kwargs):
         if getattr(manager, method, None):
             try:
                 return getattr(manager, method)(*args, **kwargs)
+            except errors.HardwareManagerConfigurationError as e:
+                LOG.error('Configuration error in HardwareManager'
+                          ' %(manager)s: %(e)s',
+                          {'manager': manager, 'e': e})
+                raise
             except errors.IncompatibleHardwareMethodError:
-                LOG.debug('HardwareManager %(manager)s does not '
-                          'support %(method)s',
-                          {'manager': manager, 'method': method})
+                pass
             except Exception as e:
                 LOG.exception('Unexpected error dispatching %(method)s to '
                               'manager %(manager)s: %(e)s',
@@ -3120,20 +4098,14 @@ def deduplicate_steps(candidate_steps):
         all managers, key=manager, value=list of steps
     :returns: A deduplicated dictionary of {hardware_manager: [steps]}
     """
-    support = dispatch_to_all_managers(
-        'evaluate_hardware_support')
+    support = {hwm['name']: hwm['support']
+               for hwm in get_managers_detail()}
 
     steps = collections.defaultdict(list)
     deduped_steps = collections.defaultdict(list)
 
     for manager, manager_steps in candidate_steps.items():
         # We cannot deduplicate steps with unknown hardware support
-        if manager not in support:
-            LOG.warning('Unknown hardware support for %(manager)s, '
-                        'dropping steps: %(steps)s',
-                        {'manager': manager, 'steps': manager_steps})
-            continue
-
         for step in manager_steps:
             # build a new dict of steps that's easier to filter
             step['hwm'] = {'name': manager,
@@ -3161,16 +4133,16 @@ def get_multipath_status():
 def safety_check_block_device(node, device):
     """Performs safety checking of a block device before destroying.
 
-    In order to guard against distruction of file systems such as
+    In order to guard against destruction of file systems such as
     shared-disk file systems
     (https://en.wikipedia.org/wiki/Clustered_file_system#SHARED-DISK)
     or similar filesystems where multiple distinct computers may have
     unlocked concurrent IO access to the entire block device or
     SAN Logical Unit Number, we need to evaluate, and block cleaning
-    from occuring on these filesystems *unless* we have been explicitly
+    from occurring on these filesystems *unless* we have been explicitly
     configured to do so.
 
-    This is because cleaning is an intentionally distructive operation,
+    This is because cleaning is an intentionally destructive operation,
     and once started against such a device, given the complexities of
     shared disk clustered filesystems where concurrent access is a design
     element, in all likelihood the entire cluster can be negatively
@@ -3201,9 +4173,9 @@ def safety_check_block_device(node, device):
     if not di_info.get('wipe_special_filesystems', True):
         return
     lsblk_ids = ['UUID', 'PTUUID', 'PARTTYPE', 'PARTUUID']
-    report = il_utils.execute('lsblk', '-bia', '--json',
-                              '-o{}'.format(','.join(lsblk_ids)),
-                              device, check_exit_code=[0])[0]
+    report = utils.execute('lsblk', '-bia', '--json',
+                           '-o{}'.format(','.join(lsblk_ids)),
+                           device, check_exit_code=[0])[0]
 
     try:
         report_json = json.loads(report)
@@ -3228,7 +4200,7 @@ def safety_check_block_device(node, device):
 def _check_for_special_partitions_filesystems(device, ids, fs_types):
     """Compare supplied IDs, Types to known items, and raise if found.
 
-    :param device: The block device in use, specificially for logging.
+    :param device: The block device in use, specifically for logging.
     :param ids: A list above IDs found to check.
     :param fs_types: A list of FS types found to check.
     :raises: ProtectedDeviceError should a partition label or metadata
@@ -3259,3 +4231,11 @@ def _check_for_special_partitions_filesystems(device, ids, fs_types):
                 raise errors.ProtectedDeviceError(
                     device=device,
                     what=value)
+
+
+def filter_devices(device_list):
+    """Filter devices by using the Hardware Manager's filter_device calls."""
+    return [
+        new for orig in device_list
+        if (new := dispatch_to_managers('filter_device', orig)) is not None
+    ]

@@ -15,8 +15,6 @@
 import json
 import uuid
 
-from ironic_lib import exception as lib_exc
-
 
 class Serializable(object):
     """Base class for things that can be serialized."""
@@ -25,6 +23,11 @@ class Serializable(object):
     def serialize(self):
         """Turn this object into a dict."""
         return dict((f, getattr(self, f)) for f in self.serializable_fields)
+
+    def __repr__(self):
+        fields = " ".join(f"{f}=" + repr(getattr(self, f))
+                          for f in self.serializable_fields)
+        return f"<{self.__class__.__name__} {fields}>"
 
 
 class SerializableComparable(Serializable):
@@ -43,14 +46,6 @@ class SerializableComparable(Serializable):
 
     def __ne__(self, other):
         return self.serialize() != other.serialize()
-
-
-def serialize_lib_exc(exc):
-    """Serialize an ironic-lib exception."""
-    return {'type': exc.__class__.__name__,
-            'code': exc.code,
-            'message': str(exc),
-            'details': ''}
 
 
 class RESTJSONEncoder(json.JSONEncoder):
@@ -78,7 +73,5 @@ class RESTJSONEncoder(json.JSONEncoder):
             return o.serialize()
         elif isinstance(o, uuid.UUID):
             return str(o)
-        elif isinstance(o, lib_exc.IronicException):
-            return serialize_lib_exc(o)
         else:
             return json.JSONEncoder.default(self, o)

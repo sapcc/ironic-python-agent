@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from http import client as http_client
 import json
 import os
 import time
 
-from ironic_lib import mdns
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -30,6 +30,7 @@ from ironic_python_agent import config
 from ironic_python_agent import encoding
 from ironic_python_agent import errors
 from ironic_python_agent import hardware
+from ironic_python_agent import mdns
 from ironic_python_agent import utils
 
 
@@ -52,8 +53,9 @@ def extension_manager(names):
 
 
 def _get_collector_names():
-    return [x.strip() for x in CONF.inspection_collectors.split(',')
-            if x.strip()]
+    collectors = (CONF.inspection_collectors
+                  or config.INSPECTION_DEFAULT_COLLECTORS)
+    return [x.strip() for x in collectors.split(',') if x.strip()]
 
 
 def inspect():
@@ -66,7 +68,8 @@ def inspect():
              was not found in inspector cache. None is also returned if
              inspector support is not enabled.
     """
-    if not CONF.inspection_callback_url:
+    if (not CONF.inspection_callback_url
+            and not (CONF.inspection_collectors and CONF.api_url)):
         LOG.info('Inspection is disabled, skipping')
         return
 
@@ -117,14 +120,22 @@ def inspect():
 
 
 _RETRY_WAIT = 5
+_RETRY_WAIT_MAX = 30
 _RETRY_ATTEMPTS = 5
+
+
+def _get_urls():
+    urls = CONF.inspection_callback_url or CONF.api_url
+    urls = list(filter(None, urls.split(',')))
+    if not CONF.inspection_callback_url:
+        urls = [url.rstrip('/') + "/v1/continue_inspection" for url in urls]
+    return urls
 
 
 def call_inspector(data, failures):
     """Post data to inspector."""
     data['error'] = failures.get_error()
 
-    LOG.info('posting collected data to %s', CONF.inspection_callback_url)
     LOG.debug('collected data: %s',
               {k: v for k, v in data.items() if k not in _NO_LOGGING_FIELDS})
 
@@ -132,15 +143,44 @@ def call_inspector(data, failures):
     data = encoder.encode(data)
     verify, cert = utils.get_ssl_client_options(CONF)
 
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+    if CONF.global_request_id:
+        headers["X-OpenStack-Request-ID"] = CONF.global_request_id
+
+    urls = _get_urls()
+
     @tenacity.retry(
         retry=tenacity.retry_if_exception_type(
-            requests.exceptions.ConnectionError),
+            (requests.exceptions.ConnectionError,
+             requests.exceptions.HTTPError)),
         stop=tenacity.stop_after_attempt(_RETRY_ATTEMPTS),
-        wait=tenacity.wait_fixed(_RETRY_WAIT),
+        wait=tenacity.wait_exponential(multiplier=1.5,
+                                       min=_RETRY_WAIT, max=_RETRY_WAIT_MAX),
         reraise=True)
     def _post_to_inspector():
-        return requests.post(CONF.inspection_callback_url, data=data,
-                             verify=verify, cert=cert)
+        for url in urls:
+            LOG.info('Posting collected data to %s', url)
+            try:
+                inspector_resp = requests.post(
+                    url, data=data, headers=headers,
+                    verify=verify, cert=cert,
+                    timeout=CONF.http_request_timeout)
+            except requests.exceptions.ConnectionError as exc:
+                if url == urls[-1]:
+                    raise
+                LOG.warning("Connection error when accessing %s, trying the "
+                            "next URL. Error: %s", url, exc)
+            else:
+                break
+
+        if (inspector_resp.status_code >= 500
+                or inspector_resp.status_code == http_client.CONFLICT):
+            raise requests.exceptions.HTTPError(response=inspector_resp)
+
+        return inspector_resp
 
     resp = _post_to_inspector()
     if resp.status_code >= 400:
@@ -355,6 +395,16 @@ def collect_pci_devices_info(data, failures):
                 LOG.warning('Wrong format of PCI revision in PCI '
                             'device %s: %s', subdir, exc)
 
+        pci_numa_node_id = None
+        pci_numa_path = os.path.join(pci_devices_path, subdir, 'numa_node')
+        if os.path.isfile(pci_numa_path):
+            try:
+                with open(pci_numa_path) as vendor_numa_node:
+                    pci_numa_node_id = vendor_numa_node.read().strip()
+            except IOError as exc:
+                LOG.warning('Failed to gather numa_node id '
+                            'from PCI device %s: %s', subdir, exc)
+
         LOG.debug(
             'Found a PCI device with vendor id %s, product id %s, class %s '
             'and revision %s', vendor, device, pci_class, pci_revision)
@@ -362,5 +412,25 @@ def collect_pci_devices_info(data, failures):
                                  'product_id': device,
                                  'class': pci_class,
                                  'revision': pci_revision,
-                                 'bus': subdir})
+                                 'bus': subdir,
+                                 'numa_node_id': pci_numa_node_id})
+
     data['pci_devices'] = pci_devices_info
+
+
+def collect_lldp(data, failures):
+    """Collect LLDP information for network interfaces.
+
+    :param data: mutable data that we'll send to inspector
+    :param failures: AccumulatedFailures object
+    """
+    data['lldp_raw'] = hardware.dispatch_to_managers('collect_lldp_data')
+
+
+def collect_usb_devices(data, failures):
+    """Collect USB information for connected devices.
+
+    :param data: mutable data that we'll send to inspector
+    :param failures: AccumulatedFailures object
+    """
+    data['usb_devices'] = hardware.dispatch_to_managers('get_usb_devices')

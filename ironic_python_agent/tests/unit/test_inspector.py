@@ -49,7 +49,7 @@ class AcceptingFailure(mock.Mock):
 
 class TestMisc(base.IronicAgentTest):
     def test_default_collector_loadable(self):
-        defaults = config.INSPECTION_DEFAULT_COLLECTOR.split(',')
+        defaults = config.INSPECTION_DEFAULT_COLLECTORS.split(',')
         # default should go first
         self.assertEqual('default', defaults[0])
         # logs much go last
@@ -71,7 +71,6 @@ class TestInspect(base.IronicAgentTest):
     def setUp(self):
         super(TestInspect, self).setUp()
         CONF.set_override('inspection_callback_url', 'http://foo/bar')
-        CONF.set_override('inspection_collectors', '')
         self.mock_collect = AcceptingFailure()
         self.mock_ext = mock.Mock(spec=['plugin', 'name'],
                                   plugin=self.mock_collect)
@@ -85,8 +84,37 @@ class TestInspect(base.IronicAgentTest):
         self.mock_collect.assert_called_with_failure()
         mock_call.assert_called_with_failure()
         self.assertEqual('uuid1', result)
+        mock_ext_mgr.assert_called_once_with(
+            inspector._COLLECTOR_NS, ['default', 'logs'],
+            name_order=True, on_missing_entrypoints_callback=mock.ANY)
 
-    @mock.patch('ironic_lib.mdns.get_endpoint', autospec=True)
+    def test_ok_with_ironic_url(self, mock_ext_mgr, mock_call):
+        CONF.set_override('api_url', 'http://url')
+        CONF.set_override('inspection_callback_url', '')
+        CONF.set_override('inspection_collectors', 'default')
+        mock_ext_mgr.return_value = [self.mock_ext]
+        mock_call.return_value = {'uuid': 'uuid1'}
+
+        result = inspector.inspect()
+
+        self.mock_collect.assert_called_with_failure()
+        mock_call.assert_called_with_failure()
+        self.assertEqual('uuid1', result)
+        mock_ext_mgr.assert_called_once_with(
+            inspector._COLLECTOR_NS, ['default'],
+            name_order=True, on_missing_entrypoints_callback=mock.ANY)
+
+    def test_disabled(self, mock_ext_mgr, mock_call):
+        CONF.set_override('inspection_callback_url', '')
+        mock_ext_mgr.return_value = [self.mock_ext]
+
+        result = inspector.inspect()
+
+        self.mock_collect.assert_not_called()
+        mock_call.assert_not_called()
+        self.assertIsNone(result)
+
+    @mock.patch('ironic_python_agent.mdns.get_endpoint', autospec=True)
     def test_mdns(self, mock_mdns, mock_ext_mgr, mock_call):
         CONF.set_override('inspection_callback_url', 'mdns')
         mock_mdns.return_value = 'http://example', {
@@ -161,9 +189,31 @@ class TestCallInspector(base.IronicAgentTest):
 
         res = inspector.call_inspector(data, failures)
 
-        mock_post.assert_called_once_with('url',
-                                          cert=None, verify=True,
-                                          data='{"data": 42, "error": null}')
+        mock_post.assert_called_once_with(
+            'url', data='{"data": 42, "error": null}',
+            cert=None, verify=True,
+            headers={'Content-Type': 'application/json',
+                     'Accept': 'application/json'},
+            timeout=30)
+        self.assertEqual(mock_post.return_value.json.return_value, res)
+
+    def test_use_api_url(self, mock_post):
+        CONF.set_override('inspection_callback_url', '')
+        CONF.set_override('api_url', 'http://url1/,http://url2/baremetal')
+
+        failures = utils.AccumulatedFailures()
+        data = collections.OrderedDict(data=42)
+        mock_post.return_value.status_code = 200
+
+        res = inspector.call_inspector(data, failures)
+
+        mock_post.assert_called_once_with(
+            'http://url1/v1/continue_inspection',
+            data='{"data": 42, "error": null}',
+            cert=None, verify=True,
+            headers={'Content-Type': 'application/json',
+                     'Accept': 'application/json'},
+            timeout=30)
         self.assertEqual(mock_post.return_value.json.return_value, res)
 
     def test_send_failure(self, mock_post):
@@ -176,7 +226,9 @@ class TestCallInspector(base.IronicAgentTest):
 
         mock_post.assert_called_once_with('url',
                                           cert=None, verify=True,
-                                          data='{"data": 42, "error": "boom"}')
+                                          data='{"data": 42, "error": "boom"}',
+                                          headers=mock.ANY,
+                                          timeout=30)
         self.assertEqual(mock_post.return_value.json.return_value, res)
 
     def test_inspector_error(self, mock_post):
@@ -188,10 +240,13 @@ class TestCallInspector(base.IronicAgentTest):
 
         mock_post.assert_called_once_with('url',
                                           cert=None, verify=True,
-                                          data='{"data": 42, "error": null}')
+                                          data='{"data": 42, "error": null}',
+                                          headers=mock.ANY,
+                                          timeout=30)
         self.assertIsNone(res)
 
     @mock.patch.object(inspector, '_RETRY_WAIT', 0.01)
+    @mock.patch.object(inspector, '_RETRY_WAIT_MAX', 1)
     def test_inspector_retries(self, mock_post):
         mock_post.side_effect = requests.exceptions.ConnectionError
         failures = utils.AccumulatedFailures()
@@ -200,6 +255,85 @@ class TestCallInspector(base.IronicAgentTest):
                           inspector.call_inspector,
                           data, failures)
         self.assertEqual(5, mock_post.call_count)
+
+    @mock.patch.object(inspector, '_RETRY_WAIT', 0.01)
+    @mock.patch.object(inspector, '_RETRY_WAIT_MAX', 1)
+    def test_inspector_several_urls(self, mock_post):
+        CONF.set_override('inspection_callback_url', 'url1,url2')
+        mock_post.side_effect = [
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ConnectionError,
+            mock.Mock(status_code=200),
+        ]
+        failures = utils.AccumulatedFailures()
+        data = collections.OrderedDict(data=42)
+        inspector.call_inspector(data, failures)
+        self.assertEqual(3, mock_post.call_count)
+        mock_post.assert_has_calls([
+            mock.call('url1', cert=None, verify=True, headers=mock.ANY,
+                      data='{"data": 42, "error": null}', timeout=30),
+            mock.call('url2', cert=None, verify=True, headers=mock.ANY,
+                      data='{"data": 42, "error": null}', timeout=30),
+            mock.call('url1', cert=None, verify=True, headers=mock.ANY,
+                      data='{"data": 42, "error": null}', timeout=30),
+        ])
+
+    def test_use_several_api_urls(self, mock_post):
+        CONF.set_override('inspection_callback_url', '')
+        CONF.set_override('api_url', 'http://url1/,http://url2/baremetal')
+
+        good_resp = mock.Mock(status_code=200)
+        mock_post.side_effect = [
+            requests.exceptions.ConnectionError, good_resp
+        ]
+
+        failures = utils.AccumulatedFailures()
+        data = collections.OrderedDict(data=42)
+        mock_post.return_value.status_code = 200
+
+        res = inspector.call_inspector(data, failures)
+
+        mock_post.assert_has_calls([
+            mock.call('http://url1/v1/continue_inspection',
+                      cert=None, verify=True, headers=mock.ANY,
+                      data='{"data": 42, "error": null}', timeout=30),
+            mock.call('http://url2/baremetal/v1/continue_inspection',
+                      cert=None, verify=True, headers=mock.ANY,
+                      data='{"data": 42, "error": null}', timeout=30),
+        ])
+        self.assertEqual(good_resp.json.return_value, res)
+
+    @mock.patch.object(inspector, '_RETRY_WAIT', 0.01)
+    @mock.patch.object(inspector, '_RETRY_WAIT_MAX', 1)
+    @mock.patch.object(inspector, '_RETRY_ATTEMPTS', 3)
+    def test_inspector_retries_on_50X_error(self, mock_post):
+        mock_post.side_effect = [mock.Mock(status_code=500),
+                                 mock.Mock(status_code=409),
+                                 mock.Mock(status_code=502)]
+        failures = utils.AccumulatedFailures()
+        data = collections.OrderedDict(data=42)
+        self.assertRaises(requests.exceptions.HTTPError,
+                          inspector.call_inspector,
+                          data, failures)
+        self.assertEqual(3, mock_post.call_count)
+
+    @mock.patch.object(inspector, '_RETRY_WAIT', 0.01)
+    @mock.patch.object(inspector, '_RETRY_WAIT_MAX', 1)
+    @mock.patch.object(inspector, '_RETRY_ATTEMPTS', 3)
+    def test_inspector_retry_on_50X_and_succeed(self, mock_post):
+        mock_post.side_effect = [mock.Mock(status_code=503),
+                                 mock.Mock(status_code=409),
+                                 mock.Mock(status_code=200)]
+
+        failures = utils.AccumulatedFailures()
+        data = collections.OrderedDict(data=42)
+        inspector.call_inspector(data, failures)
+        self.assertEqual(3, mock_post.call_count)
+        mock_post.assert_called_with('url',
+                                     cert=None, verify=True,
+                                     data='{"data": 42, "error": null}',
+                                     headers=mock.ANY,
+                                     timeout=30)
 
 
 class BaseDiscoverTest(base.IronicAgentTest):
@@ -382,14 +516,14 @@ class TestCollectPciDevicesInfo(base.IronicAgentTest):
         mock_listdir.return_value = subdirs
         mock_isfile.return_value = True
         mock_isdir.return_value = True
-        reads = ['0x1234', '0x5678', '0x060000', '0x01',
-                 '0x9876', '0x5432', '0x030000', '0x00']
+        reads = ['0x1234', '0x5678', '0x060000', '0x01', '-1',
+                 '0x9876', '0x5432', '0x030000', '0x02', '-1']
         expected_pci_devices = [{'vendor_id': '1234', 'product_id': '5678',
                                  'class': '060000', 'revision': '01',
-                                 'bus': 'foo'},
+                                 'bus': 'foo', 'numa_node_id': '-1'},
                                 {'vendor_id': '9876', 'product_id': '5432',
-                                 'class': '030000', 'revision': '00',
-                                 'bus': 'bar'}]
+                                 'class': '030000', 'revision': '02',
+                                 'bus': 'bar', 'numa_node_id': '-1'}]
 
         mock_open = mock.mock_open()
         with mock.patch('builtins.open', mock_open):
@@ -397,7 +531,32 @@ class TestCollectPciDevicesInfo(base.IronicAgentTest):
             mock_read.side_effect = reads
             inspector.collect_pci_devices_info(self.data, self.failures)
 
-        self.assertEqual(4 * len(subdirs), mock_open.call_count)
+        self.assertEqual(5 * len(subdirs), mock_open.call_count)
+        self.assertListEqual(expected_pci_devices, self.data['pci_devices'])
+
+    @mock.patch.object(os.path, 'isdir', autospec=True)
+    @mock.patch.object(os.path, 'isfile', autospec=True)
+    def test_success_numa_ioerror(self, mock_isdir, mock_isfile, mock_listdir):
+        subdirs = ['foo', 'bar']
+        mock_listdir.return_value = subdirs
+        mock_isfile.return_value = True
+        mock_isdir.return_value = True
+        reads = ['0x1234', '0x5678', '0x060000', '0x01', IOError,
+                 '0x9876', '0x5432', '0x030000', '0x00', IOError]
+        expected_pci_devices = [{'vendor_id': '1234', 'product_id': '5678',
+                                 'class': '060000', 'revision': '01',
+                                 'bus': 'foo', 'numa_node_id': None},
+                                {'vendor_id': '9876', 'product_id': '5432',
+                                 'class': '030000', 'revision': '00',
+                                 'bus': 'bar', 'numa_node_id': None}]
+
+        mock_open = mock.mock_open()
+        with mock.patch('builtins.open', mock_open):
+            mock_read = mock_open.return_value.read
+            mock_read.side_effect = reads
+            inspector.collect_pci_devices_info(self.data, self.failures)
+
+        self.assertEqual(5 * len(subdirs), mock_open.call_count)
         self.assertListEqual(expected_pci_devices, self.data['pci_devices'])
 
     def test_wrong_path(self, mock_listdir):
@@ -413,13 +572,13 @@ class TestCollectPciDevicesInfo(base.IronicAgentTest):
     def test_bad_pci_device_info(self, mock_isdir, mock_isfile, mock_listdir):
         subdirs = ['foo', 'bar', 'baz']
         mock_listdir.return_value = subdirs
-        mock_isfile.return_value = False
+        mock_isfile.return_value = True
         mock_isdir.return_value = True
-        reads = ['0x1234', '0x5678', '0x060000', '0x9876',
+        reads = ['0x1234', '0x5678', '0x060000', '0x01', '-1',
                  IOError, IndexError]
         expected_pci_devices = [{'vendor_id': '1234', 'product_id': '5678',
-                                 'class': '060000', 'revision': None,
-                                 'bus': 'foo'}]
+                                 'class': '060000', 'revision': '01',
+                                 'bus': 'foo', 'numa_node_id': '-1'}]
 
         mock_open = mock.mock_open()
         with mock.patch('builtins.open', mock_open):
@@ -428,8 +587,8 @@ class TestCollectPciDevicesInfo(base.IronicAgentTest):
             inspector.collect_pci_devices_info(self.data, self.failures)
 
         # note(sborkows): due to throwing IOError, the corresponding mock_open
-        # will not be called, so there are 6 mock_open calls in total
-        self.assertEqual(6, mock_open.call_count)
+        # will not be called, so there are 7 mock_open calls in total
+        self.assertEqual(7, mock_open.call_count)
         self.assertListEqual(expected_pci_devices, self.data['pci_devices'])
 
 
@@ -498,9 +657,12 @@ class TestWaitForDhcp(base.IronicAgentTest):
         self.assertEqual(2, mocked_dispatch.call_count)
 
     @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch.object(time, 'time_ns', autospec=True,
+                       side_effect=[1000000000, 1100000000])
     @mock.patch.object(time, 'time', autospec=True,
                        side_effect=[1.0, 1.1, 3.1, 3.2])
-    def test_timeout(self, mocked_time, mocked_sleep, mocked_dispatch):
+    def test_timeout(self, mocked_time, mocked_time_ns, mocked_sleep,
+                     mocked_dispatch):
         CONF.set_override('inspection_dhcp_all_interfaces', True)
         CONF.set_override('inspection_dhcp_wait_timeout', 1)
 
@@ -515,8 +677,9 @@ class TestWaitForDhcp(base.IronicAgentTest):
         mocked_dispatch.assert_called_with('list_network_interfaces')
         mocked_sleep.assert_called_once_with(inspector._DHCP_RETRY_INTERVAL)
         # time.time() was called 3 times explicitly in wait_for_dhcp(),
-        # and 1 in LOG.warning()
-        self.assertEqual(4, mocked_time.call_count)
+        # and 1 in LOG.warning() Python 3.13 uses time.time_ns for logging
+        total_time_calls = mocked_time.call_count + mocked_time_ns.call_count
+        self.assertEqual(4, total_time_calls)
 
     def test_disabled(self, mocked_dispatch):
         CONF.set_override('inspection_dhcp_wait_timeout', 0)

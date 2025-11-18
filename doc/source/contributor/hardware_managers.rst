@@ -21,12 +21,23 @@ How are methods executed on HardwareManagers?
 ---------------------------------------------
 Methods that modify hardware are dispatched to each hardware manager in
 priority order. When a method is dispatched, if a hardware manager does not
-have a method by that name or raises `IncompatibleHardwareMethodError`, IPA
+have a method by that name or raises ``IncompatibleHardwareMethodError``, IPA
 continues on to the next hardware manager. Any hardware manager that returns
 a result from the method call is considered a success and its return value
 passed on to whatever dispatched the method. If the method is unable to run
-successfully on any hardware managers, `HardwareManagerMethodNotFound` is
+successfully on any hardware managers, ``HardwareManagerMethodNotFound`` is
 raised.
+
+Some methods, such as ``filter_device``, are expected to return ``None`` to
+indicate a negative result (i.e., to exclude a device) which happens when
+one or more hardware managers override the method and at least one
+explicitly returns ``None``. If dispatch ever reaches the generic manager,
+the device is returned without filtering.
+
+This design allows granular control over filtering. To avoid unintentionally
+excluding devices, hardware managers must either return the device (or a
+modified copy), raise ``IncompatibleHardwareMethodError``, or refrain from
+overriding the method at all.
 
 Why build a custom HardwareManager?
 -----------------------------------
@@ -65,11 +76,11 @@ in :ironic-doc:`Ironic Cleaning </admin/cleaning.html>`. A node will perform
 a set of cleaning steps any time the node is deleted by a tenant or moved from
 ``manageable`` state to ``available`` state. Ironic will query
 IPA for a list of clean steps that should be executed on the node. IPA
-will dispatch a call to `get_clean_steps()` on all available hardware managers
-and then return the combined list to Ironic.
+will dispatch a call to ``get_clean_steps()`` on all available hardware
+managers and then return the combined list to Ironic.
 
 To expose extra clean steps, the custom hardware manager should have a function
-named `get_clean_steps()` which returns a list of dictionaries. The
+named ``get_clean_steps()`` which returns a list of dictionaries. The
 dictionaries should be in the form:
 
 .. code-block:: python
@@ -89,18 +100,18 @@ dictionaries should be in the form:
             }
         ]
 
-Then, you should create functions which match each of the `step` keys in
-the clean steps you return. The functions will take two parameters: `node`,
-a dictionary representation of the Ironic node, and `ports`, a list of
-dictionary representations of the Ironic ports attached to `node`.
+Then, you should create functions which match each of the ``step`` keys in
+the clean steps you return. The functions will take two parameters: ``node``,
+a dictionary representation of the Ironic node, and ``ports``, a list of
+dictionary representations of the Ironic ports attached to ``node``.
 
-When a clean step is executed in IPA, the `step` key will be sent to the
+When a clean step is executed in IPA, the ``step`` key will be sent to the
 hardware managers in hardware support order, using
-`hardware.dispatch_to_managers()`. For each hardware manager, if the manager
-has a function matching the `step` key, it will be executed. If the function
+``hardware.dispatch_to_managers()``. For each hardware manager, if the manager
+has a function matching the ``step`` key, it will be executed. If the function
 returns a value (including None), that value is returned to Ironic and no
 further managers are called. If the function raises
-`IncompatibleHardwareMethodError`, the next manager will be called. If the
+``IncompatibleHardwareMethodError``, the next manager will be called. If the
 function raises any other exception, the command will be considered failed,
 the command result's error message will be set to the exception's error
 message, and no further managers will be called. An example step:
@@ -113,6 +124,13 @@ message, and no further managers will be called. An example step:
             return 'upgraded firmware'
         else:
             raise errors.IncompatibleHardwareMethodError()
+
+
+.. note::
+
+   If creating a new step, the value returned must be serializable into an
+   API response and log message. If replacing an existing step, you should
+   return a response of the same type and style of the upstream step.
 
 If the step has args, you need to add them to argsinfo and provide the
 function with extra parameters.
@@ -152,7 +170,7 @@ function with extra parameters.
 
 .. note::
 
-    If two managers return steps with the same `step` key, the priority will
+    If two managers return steps with the same ``step`` key, the priority will
     be set to whichever manager has a higher hardware support level and then
     use the higher priority in the case of a tie.
 
@@ -246,6 +264,52 @@ There are two kinds of deploy steps:
     def write_a_file(self, node, ports, path, contents, mode=0o644):
         pass  # Mount the disk, write a file.
 
+Custom HardwareManagers and Service operations
+----------------------------------------------
+
+Starting with the Bobcat release cycle, A hardware manager can define
+*service steps* that may be run during a service operation by exposing a
+``get_service_steps`` call.
+
+Service steps are intended to be invoked by an operator to perform an ad-hoc
+action upon a node. This does not include automatic step execution, but may
+at some point in the future. The result is that steps can be exposed similar
+to Clean steps and Deploy steps, just the priority value, should be 0 as
+the user requested order is what is utilized.
+
+.. code-block:: python
+
+    def get_service_steps(self, node, ports):
+        return [
+            {
+                # A function on the custom hardware manager
+                'step': 'write_a_file',
+                # Steps with priority 0 don't run by default.
+                'priority': 0,
+                # Should be the deploy interface, unless there is driver-side
+                # support for another interface (as it is for RAID).
+                'interface': 'deploy',
+                # Arguments that can be required or optional.
+                'argsinfo': {
+                    'path': {
+                        'description': 'Path to file',
+                        'required': True,
+                    },
+                    'content': {
+                        'description': 'Content of the file',
+                        'required': True,
+                    },
+                    'mode': {
+                        'description': 'Mode of the file, defaults to 0644',
+                        'required': False,
+                    },
+                }
+            }
+        ]
+
+    def write_a_file(self, node, ports, path, contents, mode=0o644):
+        pass  # Mount the disk, write a file.
+
 Versioning
 ~~~~~~~~~~
 Each hardware manager has a name and a version. This version is used during
@@ -266,10 +330,10 @@ Priority
 ~~~~~~~~
 A hardware manager has a single overall priority, which should be based on how
 well it supports a given piece of hardware. At load time, IPA executes
-`evaluate_hardware_support()` on each hardware manager. This method should
+``evaluate_hardware_support()`` on each hardware manager. This method should
 return an int representing hardware manager priority, based on what it detects
 about the platform it's running on. Suggested values are included in the
-`HardwareSupport` class. Returning a value of 0 aka `HardwareSupport.NONE`,
+``HardwareSupport`` class. Returning a value of 0 aka ``HardwareSupport.NONE``,
 will prevent the hardware manager from being used. IPA will never ship a
 hardware manager with a priority higher than 3, aka
-`HardwareSupport.SERVICE_PROVIDER`.
+``HardwareSupport.SERVICE_PROVIDER``.

@@ -22,14 +22,10 @@ import gzip
 import io
 import math
 import os
-import shlex
 import shutil
 import stat
 import tempfile
 
-from ironic_lib import disk_utils
-from ironic_lib import exception
-from ironic_lib import utils
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log
@@ -38,18 +34,24 @@ from oslo_utils import units
 from oslo_utils import uuidutils
 import requests
 
+from ironic_python_agent import disk_utils
 from ironic_python_agent import errors
 from ironic_python_agent import hardware
-from ironic_python_agent import utils as ipa_utils
+from ironic_python_agent import utils
 
 
-LOG = log.getLogger()
+LOG = log.getLogger(__name__)
 CONF = cfg.CONF
 
 MAX_CONFIG_DRIVE_SIZE_MB = 64
 
 # Maximum disk size supported by MBR is 2TB (2 * 1024 * 1024 MB)
 MAX_DISK_SIZE_MB_SUPPORTED_BY_MBR = 2097152
+
+
+def _is_http_url(url):
+    url = url.lower()
+    return url.startswith('http://') or url.startswith('https://')
 
 
 def get_configdrive(configdrive, node_uuid, tempdir=None):
@@ -66,22 +68,22 @@ def get_configdrive(configdrive, node_uuid, tempdir=None):
 
     """
     # Check if the configdrive option is a HTTP URL or the content directly
-    is_url = utils.is_http_url(configdrive)
+    is_url = _is_http_url(configdrive)
     if is_url:
-        verify, cert = ipa_utils.get_ssl_client_options(CONF)
+        verify, cert = utils.get_ssl_client_options(CONF)
         timeout = CONF.image_download_connection_timeout
         # TODO(dtantsur): support proxy parameters from instance_info
         try:
             resp = requests.get(configdrive, verify=verify, cert=cert,
                                 timeout=timeout)
         except requests.exceptions.RequestException as e:
-            raise exception.InstanceDeployFailure(
+            raise errors.DeploymentError(
                 "Can't download the configdrive content for node %(node)s "
                 "from '%(url)s'. Reason: %(reason)s" %
                 {'node': node_uuid, 'url': configdrive, 'reason': e})
 
         if resp.status_code >= 400:
-            raise exception.InstanceDeployFailure(
+            raise errors.DeploymentError(
                 "Can't download the configdrive content for node %(node)s "
                 "from '%(url)s'. Got status code %(code)s, response "
                 "body %(body)s" %
@@ -118,7 +120,7 @@ def get_configdrive(configdrive, node_uuid, tempdir=None):
                             'cls': type(exc).__name__})
             if is_url:
                 error_msg += ' Downloaded from "%s".' % configdrive
-            raise exception.InstanceDeployFailure(error_msg)
+            raise errors.DeploymentError(error_msg)
 
     configdrive_mb = 0
     with gzip.GzipFile('configdrive', 'rb', fileobj=data) as gunzipped:
@@ -127,7 +129,7 @@ def get_configdrive(configdrive, node_uuid, tempdir=None):
         except EnvironmentError as e:
             # Delete the created file
             utils.unlink_without_raise(configdrive_file.name)
-            raise exception.InstanceDeployFailure(
+            raise errors.DeploymentError(
                 'Encountered error while decompressing and writing '
                 'config drive for node %(node)s. Error: %(exc)s' %
                 {'node': node_uuid, 'exc': e})
@@ -157,7 +159,7 @@ def get_labelled_partition(device_path, label, node_uuid):
     try:
         output, err = utils.execute('lsblk', '-Po', 'name,label', device_path,
                                     check_exit_code=[0, 1],
-                                    use_standard_locale=True, run_as_root=True)
+                                    use_standard_locale=True)
 
     except (processutils.UnknownArgumentError,
             processutils.ProcessExecutionError, OSError) as e:
@@ -165,7 +167,7 @@ def get_labelled_partition(device_path, label, node_uuid):
                'for node %(node)s. Error: %(error)s' %
                {'disk': device_path, 'node': node_uuid, 'error': e})
         LOG.error(msg)
-        raise exception.InstanceDeployFailure(msg)
+        raise errors.DeploymentError(msg)
 
     found_part = None
     if output:
@@ -174,7 +176,7 @@ def get_labelled_partition(device_path, label, node_uuid):
                 if found_part:
                     found_2 = '/dev/%(part)s' % {'part': dev['NAME'].strip()}
                     found = [found_part, found_2]
-                    raise exception.InstanceDeployFailure(
+                    raise errors.DeploymentError(
                         'More than one partition with label "%(label)s" '
                         'exists on device %(device)s for node %(node)s: '
                         '%(found)s.' %
@@ -188,7 +190,8 @@ def get_labelled_partition(device_path, label, node_uuid):
 def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
                  image_path, node_uuid, preserve_ephemeral=False,
                  configdrive=None, boot_mode="bios",
-                 tempdir=None, disk_label=None, cpu_arch="", conv_flags=None):
+                 tempdir=None, disk_label=None, cpu_arch="", conv_flags=None,
+                 source_format=None, is_raw=False):
     """Create partitions and copy an image to the root partition.
 
     :param dev: Path for the device to work on.
@@ -219,6 +222,9 @@ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
     :param conv_flags: Flags that need to be sent to the dd command, to control
         the conversion of the original file when copying to the host. It can
         contain several options separated by commas.
+    :param source_format: The format of the disk image to be written.
+        If set, must be "raw" or the actual disk format of the image.
+    :param is_raw: Ironic indicator image is raw; not to be converted
     :returns: a dictionary containing the following keys:
         'root uuid': UUID of root partition
         'efi system partition uuid': UUID of the uefi system partition
@@ -261,7 +267,7 @@ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
         root_part = part_dict.get('root')
 
         if not disk_utils.is_block_device(root_part):
-            raise exception.InstanceDeployFailure(
+            raise errors.DeploymentError(
                 "Root device '%s' not found" % root_part)
 
         for part in ('swap', 'ephemeral', 'configdrive',
@@ -271,7 +277,7 @@ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
                       "%(node)s.", {'part': part, 'dev': part_device,
                                     'node': node_uuid})
             if part_device and not disk_utils.is_block_device(part_device):
-                raise exception.InstanceDeployFailure(
+                raise errors.DeploymentError(
                     "'%(partition)s' device '%(part_device)s' not found" %
                     {'partition': part, 'part_device': part_device})
 
@@ -296,7 +302,8 @@ def work_on_disk(dev, root_mb, swap_mb, ephemeral_mb, ephemeral_format,
             utils.unlink_without_raise(configdrive_file)
 
     if image_path is not None:
-        disk_utils.populate_image(image_path, root_part, conv_flags=conv_flags)
+        disk_utils.populate_image(image_path, root_part, conv_flags=conv_flags,
+                                  is_raw=is_raw, source_format=source_format)
         LOG.info("Image for %(node)s successfully populated",
                  {'node': node_uuid})
     else:
@@ -361,7 +368,7 @@ def create_config_drive_partition(node_uuid, device, configdrive):
 
         confdrive_mb, confdrive_file = get_configdrive(configdrive, node_uuid)
         if confdrive_mb > MAX_CONFIG_DRIVE_SIZE_MB:
-            raise exception.InstanceDeployFailure(
+            raise errors.DeploymentError(
                 'Config drive size exceeds maximum limit of 64MiB. '
                 'Size of the given config drive is %(size)d MiB for '
                 'node %(node)s.'
@@ -383,8 +390,7 @@ def create_config_drive_partition(node_uuid, device, configdrive):
                 create_option = '0:-%dMB:0' % MAX_CONFIG_DRIVE_SIZE_MB
                 uuid_option = '0:%s' % part_uuid
                 utils.execute('sgdisk', '-n', create_option,
-                              '-u', uuid_option, device,
-                              run_as_root=True)
+                              '-u', uuid_option, device)
             else:
                 cur_parts = set(part['number']
                                 for part in disk_utils.list_partitions(device))
@@ -398,13 +404,13 @@ def create_config_drive_partition(node_uuid, device, configdrive):
                     pp_count, lp_count = disk_utils.count_mbr_partitions(
                         device)
                 except ValueError as e:
-                    raise exception.InstanceDeployFailure(
+                    raise errors.DeploymentError(
                         'Failed to check the number of primary partitions '
                         'present on %(dev)s for node %(node)s. Error: '
                         '%(error)s' % {'dev': device, 'node': node_uuid,
                                        'error': e})
                 if pp_count > 3:
-                    raise exception.InstanceDeployFailure(
+                    raise errors.DeploymentError(
                         'Config drive cannot be created for node %(node)s. '
                         'Disk (%(dev)s) uses MBR partitioning and already '
                         'has %(parts)d primary partitions.'
@@ -426,7 +432,7 @@ def create_config_drive_partition(node_uuid, device, configdrive):
 
                 utils.execute('parted', '-a', 'optimal', '-s', '--', device,
                               'mkpart', 'primary', 'fat32', startlimit,
-                              endlimit, run_as_root=True)
+                              endlimit)
             # Trigger device rescan
             disk_utils.trigger_device_rescan(device)
 
@@ -435,7 +441,7 @@ def create_config_drive_partition(node_uuid, device, configdrive):
                              for part in disk_utils.list_partitions(device)}
                 new_part = set(new_parts) - set(cur_parts)
                 if len(new_part) != 1:
-                    raise exception.InstanceDeployFailure(
+                    raise errors.DeploymentError(
                         'Disk partitioning failed on device %(device)s. '
                         'Unable to retrieve config drive partition '
                         'information.' % {'device': device})
@@ -452,7 +458,7 @@ def create_config_drive_partition(node_uuid, device, configdrive):
                                'disk': device, 'node': node_uuid,
                                'uuid': part_uuid}
                     LOG.error(msg)
-                    raise exception.InstanceDeployFailure(msg)
+                    raise errors.DeploymentError(msg)
 
             disk_utils.udev_settle()
 
@@ -465,24 +471,116 @@ def create_config_drive_partition(node_uuid, device, configdrive):
                       {'part': config_drive_part, 'node': node_uuid})
             utils.execute('test', '-e', config_drive_part, attempts=15,
                           delay_on_retry=True)
-
-        disk_utils.dd(confdrive_file, config_drive_part)
+        if not CONF.config_drive_rebuild:
+            disk_utils.dd(confdrive_file, config_drive_part)
+            if not _does_config_drive_work(config_drive_part):
+                # If we have reached this point, we might have an
+                # invalid configuration drive, OR the block device
+                # layer doesn't support 2K block Logical IO (iso9660)
+                _try_build_fat32_config_drive(config_drive_part,
+                                              confdrive_file)
+        else:
+            LOG.info('Extracting configuration drive to write copy to disk.')
+            _try_build_fat32_config_drive(config_drive_part, confdrive_file)
         LOG.info("Configdrive for node %(node)s successfully "
                  "copied onto partition %(part)s",
                  {'node': node_uuid, 'part': config_drive_part})
 
+    except errors.DeploymentError:
+        # Since we no longer have a final action on the decorator, we need
+        # to catch the failure, and still perform the cleanup.
+        if confdrive_file:
+            utils.unlink_without_raise(confdrive_file)
+        raise
     except (processutils.UnknownArgumentError,
             processutils.ProcessExecutionError, OSError) as e:
         msg = ('Failed to create config drive on disk %(disk)s '
                'for node %(node)s. Error: %(error)s' %
                {'disk': device, 'node': node_uuid, 'error': e})
         LOG.error(msg)
-        raise exception.InstanceDeployFailure(msg)
-    finally:
+        raise errors.DeploymentError(msg)
         # If the configdrive was requested make sure we delete the file
         # after copying the content to the partition
+
+    finally:
         if confdrive_file:
             utils.unlink_without_raise(confdrive_file)
+
+
+def _does_config_drive_work(config_drive_part):
+    """Attempts to mount the config drive to validate it works.
+
+    :param config_drive_part: The partition to which the configuration drive
+                              was written.
+    :returns: True if we were able to mount the configuration drive partition.
+    """
+    temp_folder = tempfile.mkdtemp()
+    try:
+        # Why: If the filesystem is ISO9660 or vfat, and the logical sector
+        # size which is supported is *not* something which supports 512 bytes,
+        # i.e. a 4k Block size, then ISO9660 just will not work. Vfat also
+        # will not work because the logical size needs to match the logical
+        # size which is usable. If the underlying driver cannot use that size,
+        # then the filesystem will not work and cannot be updated because
+        # structurally it is incompaible with the block device driver.
+        utils.execute('mount', '-o', 'ro', '-t', 'auto', config_drive_part,
+                      temp_folder)
+        utils.execute('umount', temp_folder)
+    except (processutils.ProcessExecutionError, OSError) as e:
+        LOG.error('Encountered issue attempting to validate the '
+                  'supplied configuration drive. Error: %s', e)
+        return False
+    finally:
+        utils.unlink_without_raise(temp_folder)
+
+    return True
+
+
+def _try_build_fat32_config_drive(partition, confdrive_file):
+    conf_drive_temp = tempfile.mkdtemp()
+    try:
+        utils.execute('mount', '-o', 'loop,ro', '-t', 'auto',
+                      confdrive_file, conf_drive_temp)
+    except (processutils.ProcessExecutionError, OSError) as e:
+        # Config drive is invalid, at least to our point of view.
+        # Bailing.
+        LOG.warning('We were unable to examine the configuration drive, '
+                    'bypassing. Error: %s', e)
+        return
+
+    new_drive_temp = tempfile.mkdtemp()
+    try:
+        # While creating a config drive file from scratch or on
+        # a loopback will likely result in a 512 byte sector size,
+        # the underlying fat filesystem utilities *automatically*
+        # check the device block sector sizing. This *will* break
+        # above 4k blocks, or at least might. Officially, 4k is the
+        # *maximum* in the FAT standard. See:
+        # https://github.com/dosfstools/dosfstools/blame/c483196dd46eab22abba756cef511d36f5f42070/src/mkfs.fat.c#L1987
+        utils.mkfs(fs='vfat', path=partition, label='CONFIG-2')
+        utils.execute('mount', '-t', 'auto', partition, new_drive_temp)
+        # copytree, using copy2, copies everything in the source folder
+        # into the destination folder, so we should be good, and metadata
+        # is attempted to be preserved.
+        shutil.copytree(conf_drive_temp, new_drive_temp, dirs_exist_ok=True)
+    except (processutils.ProcessExecutionError, OSError) as e:
+        # We failed to make the filesystem :(
+        # This is a fairly hard error as we could not use the
+        # config drive, nor could we recover the state.
+        LOG.error('We were unable to make a new filesystem for the '
+                  'configuration drive. Error: %s', e)
+        msg = ('A failure occurred while attempting to format, copy, and '
+               're-create the configuration drive in a structure which '
+               'is compatible with the underlying hardware and Operating '
+               'System. Due to the nature of configuration drive, it could '
+               'have been incorrectly formatted. Operator investigation is '
+               'required. Error: {}'.format(str(e)))
+        raise errors.DeploymentError(msg)
+    finally:
+        utils.execute('umount', conf_drive_temp)
+        utils.execute('umount', new_drive_temp)
+        utils.unlink_without_raise(new_drive_temp)
+        utils.unlink_without_raise(conf_drive_temp)
 
 
 def _is_disk_larger_than_max_size(device, node_uuid):
@@ -497,15 +595,14 @@ def _is_disk_larger_than_max_size(device, node_uuid):
     try:
         disksize_bytes, err = utils.execute('blockdev', '--getsize64',
                                             device,
-                                            use_standard_locale=True,
-                                            run_as_root=True)
+                                            use_standard_locale=True)
     except (processutils.UnknownArgumentError,
             processutils.ProcessExecutionError, OSError) as e:
         msg = ('Failed to get size of disk %(disk)s for node %(node)s. '
                'Error: %(error)s' %
                {'disk': device, 'node': node_uuid, 'error': e})
         LOG.error(msg)
-        raise exception.InstanceDeployFailure(msg)
+        raise errors.DeploymentError(msg)
 
     disksize_mb = int(disksize_bytes.strip()) // 1024 // 1024
 
@@ -518,81 +615,72 @@ def get_partition(device, uuid):
               {'dev': device, 'uuid': uuid})
 
     try:
-        ipa_utils.rescan_device(device)
-        lsblk = utils.execute(
+        utils.rescan_device(device)
+        lsblk, _ = utils.execute(
             'lsblk', '-PbioKNAME,UUID,PARTUUID,TYPE,LABEL', device)
-        report = lsblk[0]
-        for line in report.split('\n'):
-            part = {}
-            # Split into KEY=VAL pairs
-            vals = shlex.split(line)
-            for key, val in (v.split('=', 1) for v in vals):
-                part[key] = val.strip()
-            # Ignore non partition
-            if part.get('TYPE') not in ['md', 'part']:
-                # NOTE(TheJulia): This technically creates an edge failure
-                # case where a filesystem on a whole block device sans
-                # partitioning would behave differently.
-                continue
+        if lsblk:
+            for dev in utils.parse_device_tags(lsblk):
+                # Ignore non partition
+                if dev.get('TYPE') not in ['md', 'part']:
+                    # NOTE(TheJulia): This technically creates an edge failure
+                    # case where a filesystem on a whole block device sans
+                    # partitioning would behave differently.
+                    continue
 
-            if part.get('UUID') == uuid:
-                LOG.debug("Partition %(uuid)s found on device "
-                          "%(dev)s", {'uuid': uuid, 'dev': device})
-                return '/dev/' + part.get('KNAME')
-            if part.get('PARTUUID') == uuid:
-                LOG.debug("Partition %(uuid)s found on device "
-                          "%(dev)s", {'uuid': uuid, 'dev': device})
-                return '/dev/' + part.get('KNAME')
-            if part.get('LABEL') == uuid:
-                LOG.debug("Partition %(uuid)s found on device "
-                          "%(dev)s", {'uuid': uuid, 'dev': device})
-                return '/dev/' + part.get('KNAME')
-        else:
-            # NOTE(TheJulia): We may want to consider moving towards using
-            # findfs in the future, if we're comfortable with the execution
-            # and interaction. There is value in either way though.
-            # NOTE(rg): alternative: blkid -l -t UUID=/PARTUUID=
-            try:
-                findfs, stderr = utils.execute('findfs', 'UUID=%s' % uuid)
-                return findfs.strip()
-            except processutils.ProcessExecutionError as e:
-                LOG.debug('First fallback detection attempt for locating '
-                          'partition via UUID %(uuid)s failed. '
-                          'Error: %(err)s',
-                          {'uuid': uuid,
-                           'err': e})
+                if dev.get('UUID') == uuid:
+                    LOG.debug("Partition %(uuid)s found on device "
+                              "%(dev)s", {'uuid': uuid, 'dev': device})
+                    return '/dev/' + dev.get('KNAME')
+                if dev.get('PARTUUID') == uuid:
+                    LOG.debug("Partition %(uuid)s found on device "
+                              "%(dev)s", {'uuid': uuid, 'dev': device})
+                    return '/dev/' + dev.get('KNAME')
+                if dev.get('LABEL') == uuid:
+                    LOG.debug("Partition %(uuid)s found on device "
+                              "%(dev)s", {'uuid': uuid, 'dev': device})
+                    return '/dev/' + dev.get('KNAME')
+            else:
+                # NOTE(TheJulia): We may want to consider moving towards using
+                # findfs in the future, if we're comfortable with the execution
+                # and interaction. There is value in either way though.
+                # NOTE(rg): alternative: blkid -l -t UUID=/PARTUUID=
                 try:
-                    findfs, stderr = utils.execute(
-                        'findfs', 'PARTUUID=%s' % uuid)
+                    findfs, stderr = utils.execute('findfs', 'UUID=%s' % uuid)
                     return findfs.strip()
                 except processutils.ProcessExecutionError as e:
-                    LOG.debug('Secondary fallback detection attempt for '
-                              'locating partition via UUID %(uuid)s failed. '
-                              'Error: %(err)s',
-                              {'uuid': uuid,
-                               'err': e})
+                    LOG.debug('First fallback detection attempt for locating '
+                              'partition via UUID %(uuid)s failed. '
+                              'Error: %(err)s', {'uuid': uuid, 'err': e})
+                    try:
+                        findfs, stderr = utils.execute(
+                            'findfs', 'PARTUUID=%s' % uuid)
+                        return findfs.strip()
+                    except processutils.ProcessExecutionError as e:
+                        LOG.debug('Secondary fallback detection attempt for '
+                                  'locating partition via UUID %(id)s failed.'
+                                  'Error: %(err)s', {'id': uuid, 'err': e})
 
-            # Last fallback: In case we cannot find the partition by UUID
-            # and the deploy device is an md device, we check if the md
-            # device has a partition (which we assume to contain the root fs).
-            if hardware.is_md_device(device):
-                md_partition = device + 'p1'
-                if (os.path.exists(md_partition)
-                        and stat.S_ISBLK(os.stat(md_partition).st_mode)):
-                    LOG.debug("Found md device with partition %s",
-                              md_partition)
-                    return md_partition
-                else:
-                    LOG.debug('Could not find partition %(part)s on md '
-                              'device %(dev)s',
-                              {'part': md_partition,
-                               'dev': device})
+                # Last fallback: In case we cannot find the partition by UUID
+                # and the deploy device is an md device, we check if the md
+                # device has a partition (which we assume to contain the
+                # root fs).
+                if hardware.is_md_device(device):
+                    md_partition = device + 'p1'
+                    if (os.path.exists(md_partition)
+                            and stat.S_ISBLK(os.stat(md_partition).st_mode)):
+                        LOG.debug("Found md device with partition %s",
+                                  md_partition)
+                        return md_partition
+                    else:
+                        LOG.debug('Could not find partition %(part)s on md '
+                                  'device %(dev)s', {'part': md_partition,
+                                                     'dev': device})
 
-            # Partition not found, time to escalate.
-            error_msg = ("No partition with UUID %(uuid)s found on "
-                         "device %(dev)s" % {'uuid': uuid, 'dev': device})
-            LOG.error(error_msg)
-            raise errors.DeviceNotFound(error_msg)
+                # Partition not found, time to escalate.
+                error_msg = ("No partition with UUID %(uuid)s found on "
+                             "device %(dev)s" % {'uuid': uuid, 'dev': device})
+                LOG.error(error_msg)
+                raise errors.DeviceNotFound(error_msg)
     except processutils.ProcessExecutionError as e:
         error_msg = ('Finding the partition with UUID %(uuid)s on '
                      'device %(dev)s failed with %(err)s' %

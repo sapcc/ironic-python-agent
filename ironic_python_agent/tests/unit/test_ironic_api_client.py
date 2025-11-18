@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import time
 from unittest import mock
 
 from oslo_config import cfg
@@ -339,6 +340,16 @@ class TestBaseIronicPythonAgent(base.IronicAgentTest):
                                uuid='meow',
                                advertise_address=('192.0.2.1', '9999'))
 
+    def test_heartbeat_requests_several_urls(self):
+        self.api_client.api_urls = ['2001:db8::1', '192.0.2.1']
+        self.api_client.session.request = mock.Mock()
+        self.api_client.session.request.side_effect = [
+            requests.exceptions.ConnectionError,
+            FakeResponse(status_code=202),
+        ]
+        self.api_client.heartbeat(uuid='meow',
+                                  advertise_address=('192.0.2.1', '9999'))
+
     @mock.patch('time.sleep', autospec=True)
     @mock.patch('ironic_python_agent.ironic_api_client.APIClient._do_lookup',
                 autospec=True)
@@ -460,6 +471,32 @@ class TestBaseIronicPythonAgent(base.IronicAgentTest):
             self.assertFalse(error)
             mock_log.error.assert_has_calls([])
             self.assertEqual(1, mock_log.warning.call_count)
+
+    @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch.object(ironic_api_client, 'LOG', autospec=True)
+    def test_do_lookup_node_locked(self, mock_log, mock_sleep):
+        response = FakeResponse(status_code=409, content={})
+        self.api_client.session.request = mock.Mock()
+        self.api_client.session.request.return_value = response
+        self.assertEqual(0, self.api_client.lookup_lock_pause)
+        error = self.api_client._do_lookup(self.hardware_info,
+                                           node_uuid=None)
+        self.assertFalse(error)
+        mock_log.error.assert_has_calls([])
+        self.assertEqual(1, mock_log.warning.call_count)
+        self.assertEqual(1, mock_sleep.call_count)
+        self.assertEqual(5, self.api_client.lookup_lock_pause)
+        error = self.api_client._do_lookup(self.hardware_info,
+                                           node_uuid=None)
+        self.assertEqual(10, self.api_client.lookup_lock_pause)
+        error = self.api_client._do_lookup(self.hardware_info,
+                                           node_uuid=None)
+        self.assertFalse(error)
+        self.assertEqual(30, self.api_client.lookup_lock_pause)
+        error = self.api_client._do_lookup(self.hardware_info,
+                                           node_uuid=None)
+        self.assertFalse(error)
+        self.assertEqual(30, self.api_client.lookup_lock_pause)
 
     @mock.patch.object(ironic_api_client, 'LOG', autospec=True)
     def test_do_lookup_unknown_exception(self, mock_log):

@@ -12,12 +12,13 @@
 
 import copy
 import re
+import shlex
 
-from ironic_lib import disk_utils
-from ironic_lib import utils as il_utils
 from oslo_concurrency import processutils
 from oslo_log import log as logging
 
+from ironic_python_agent import device_hints
+from ironic_python_agent import disk_utils
 from ironic_python_agent import errors
 from ironic_python_agent import utils
 
@@ -54,7 +55,7 @@ def get_block_devices_for_raid(block_devices, logical_disks):
             matching = []
             for phys_disk in logical_disk['physical_disks']:
                 candidates = [
-                    dev['name'] for dev in il_utils.find_devices_by_hints(
+                    dev['name'] for dev in device_hints.find_devices_by_hints(
                         serialized_devs, phys_disk)
                 ]
                 if not candidates:
@@ -127,7 +128,7 @@ def calc_raid_partition_sectors(psize, start):
 
     the unit of measure, compatible with parted.
     :param psize: size of the raid partition
-    :param start: start sector of the raid partion in integer format
+    :param start: start sector of the raid partition in integer format
     :return: start and end sector in parted compatible format, end sector
         as integer
     """
@@ -201,24 +202,31 @@ def _get_actual_component_devices(raid_device):
     return component_devices
 
 
-def create_raid_device(index, logical_disk):
+def create_raid_device(index, logical_disk, indices=None):
     """Create a raid device.
 
     :param index: the index of the resulting md device.
     :param logical_disk: the logical disk containing the devices used to
         crete the raid.
+    :param indices: Mapping to track the last used partition index for each
+        physical device across calls to create_raid_device.
     :raise: errors.SoftwareRAIDError if not able to create the raid device
         or fails to re-add a device to a raid.
     """
     md_device = '/dev/md%d' % index
     component_devices = []
+    if indices is None:
+        # Backward compatibility with custom hardware managers
+        indices = {dev: index for dev in logical_disk['block_devices']}
     for device in logical_disk['block_devices']:
         # The partition delimiter for all common harddrives (sd[a-z]+)
         part_delimiter = ''
         if 'nvme' in device:
             part_delimiter = 'p'
+        index_on_device = indices.get(device, 0)
         component_devices.append(
-            device + part_delimiter + str(index + RAID_PARTITION))
+            device + part_delimiter + str(index_on_device + RAID_PARTITION))
+        indices[device] = index_on_device + 1
     raid_level = logical_disk['raid_level']
     # The schema check allows '1+0', but mdadm knows it as '10'.
     if raid_level == '1+0':
@@ -226,7 +234,7 @@ def create_raid_device(index, logical_disk):
     volume_name = logical_disk.get('volume_name')
     try:
         if volume_name is None:
-            volume_name = md_device
+            volume_name = 'md%d' % index
         LOG.debug("Creating md device %(dev)s with name %(name)s"
                   "on %(comp)s",
                   {'dev': md_device, 'name': volume_name,
@@ -270,17 +278,22 @@ def get_next_free_raid_device():
     raise errors.SoftwareRAIDError("No free md (RAID) devices are left")
 
 
-def get_volume_name_of_raid_device(raid_device):
+def get_volume_name_of_raid_device(raid_device, examine=False):
     """Get the volume name of a RAID device
 
     :param raid_device: A Software RAID block device name.
+    :param examine: Use --examine instead of --detail
     :returns: volume name of the device, or None
     """
     if not raid_device:
         return None
     try:
-        out, _ = utils.execute('mdadm', '--detail', raid_device,
-                               use_standard_locale=True)
+        if examine:
+            out, _ = utils.execute('mdadm', '--examine', raid_device,
+                                   use_standard_locale=True)
+        else:
+            out, _ = utils.execute('mdadm', '--detail', raid_device,
+                                   use_standard_locale=True)
     except processutils.ProcessExecutionError as e:
         LOG.warning('Could not retrieve the volume name of %(dev)s: %(err)s',
                     {'dev': raid_device, 'err': e})
@@ -342,50 +355,58 @@ def prepare_boot_partitions_for_softraid(device, holders, efi_part,
             if efi_part:
                 efi_part = '{}p{}'.format(device, efi_part['number'])
 
-        LOG.info("Creating EFI partitions on software RAID holder disks")
-        # We know that we kept this space when configuring raid,see
-        # hardware.GenericHardwareManager.create_configuration.
-        # We could also directly get the EFI partition size.
-        partsize_mib = ESP_SIZE_MIB
-        partlabel_prefix = 'uefi-holder-'
-        efi_partitions = []
-        for number, holder in enumerate(holders):
-            # NOTE: see utils.get_partition_table_type_from_specs
-            # for uefi we know that we have setup a gpt partition table,
-            # sgdisk can be used to edit table, more user friendly
-            # for alignment and relative offsets
-            partlabel = '{}{}'.format(partlabel_prefix, number)
-            out, _u = utils.execute('sgdisk', '-F', holder)
-            start_sector = '{}s'.format(out.splitlines()[-1].strip())
-            out, _u = utils.execute(
-                'sgdisk', '-n', '0:{}:+{}MiB'.format(start_sector,
-                                                     partsize_mib),
-                '-t', '0:ef00', '-c', '0:{}'.format(partlabel), holder)
+        # check if we have a RAIDed ESP already
+        md_device = find_esp_raid()
+        if md_device:
+            LOG.info("Found RAIDed ESP %s, skip creation", md_device)
+        else:
+            LOG.info("Creating EFI partitions on software RAID holder disks")
+            # We know that we kept this space when configuring raid,see
+            # hardware.GenericHardwareManager.create_configuration.
+            # We could also directly get the EFI partition size.
+            partsize_mib = ESP_SIZE_MIB
+            partlabel_prefix = 'uefi-holder-'
+            efi_partitions = []
+            for number, holder in enumerate(holders):
+                # NOTE: see utils.get_partition_table_type_from_specs
+                # for uefi we know that we have setup a gpt partition table,
+                # sgdisk can be used to edit table, more user friendly
+                # for alignment and relative offsets
+                partlabel = '{}{}'.format(partlabel_prefix, number)
+                out, _u = utils.execute('sgdisk', '-F', holder)
+                start_sector = '{}s'.format(out.splitlines()[-1].strip())
+                out, _u = utils.execute(
+                    'sgdisk', '-n', '0:{}:+{}MiB'.format(start_sector,
+                                                         partsize_mib),
+                    '-t', '0:ef00', '-c', '0:{}'.format(partlabel), holder)
 
-            # Refresh part table
-            utils.execute("partprobe")
-            utils.execute("blkid")
+                # Refresh part table
+                utils.execute("partprobe")
+                utils.execute("blkid")
 
-            target_part, _u = utils.execute(
-                "blkid", "-l", "-t", "PARTLABEL={}".format(partlabel), holder)
+                target_part, _u = utils.execute(
+                    "blkid", "-l", "-t", "PARTLABEL={}".format(partlabel),
+                    holder)
 
-            target_part = target_part.splitlines()[-1].split(':', 1)[0]
-            efi_partitions.append(target_part)
+                target_part = target_part.splitlines()[-1].split(':', 1)[0]
+                efi_partitions.append(target_part)
 
-            LOG.debug("EFI partition %s created on holder disk %s",
-                      target_part, holder)
+                LOG.debug("EFI partition %s created on holder disk %s",
+                          target_part, holder)
 
-        # RAID the ESPs, metadata=1.0 is mandatory to be able to boot
-        md_device = get_next_free_raid_device()
-        LOG.debug("Creating md device %(md_device)s for the ESPs "
-                  "on %(efi_partitions)s",
-                  {'md_device': md_device, 'efi_partitions': efi_partitions})
-        utils.execute('mdadm', '--create', md_device, '--force',
-                      '--run', '--metadata=1.0', '--level', '1',
-                      '--name', 'esp', '--raid-devices', len(efi_partitions),
-                      *efi_partitions)
+            # RAID the ESPs, metadata=1.0 is mandatory to be able to boot
+            md_device = get_next_free_raid_device()
+            LOG.debug("Creating md device %(md_device)s for the ESPs "
+                      "on %(efi_partitions)s",
+                      {'md_device': md_device,
+                       'efi_partitions': efi_partitions})
+            utils.execute('mdadm', '--create', md_device, '--force',
+                          '--run', '--metadata=1.0', '--level', '1',
+                          '--name', 'esp', '--raid-devices',
+                          len(efi_partitions),
+                          *efi_partitions)
 
-        disk_utils.trigger_device_rescan(md_device)
+            disk_utils.trigger_device_rescan(md_device)
 
         if efi_part:
             # Blockdev copy the source ESP and erase it
@@ -395,7 +416,7 @@ def prepare_boot_partitions_for_softraid(device, holders, efi_part,
             utils.execute('wipefs', '-a', efi_part)
         else:
             fslabel = 'efi-part'
-            il_utils.mkfs(fs='vfat', path=md_device, label=fslabel)
+            utils.mkfs(fs='vfat', path=md_device, label=fslabel)
 
         return md_device
 
@@ -420,3 +441,18 @@ def prepare_boot_partitions_for_softraid(device, holders, efi_part,
             # disk, as in virtual disk, where to load the data from.
             # Since there is a structural difference, this means it will
             # fail.
+
+
+def find_esp_raid():
+    """Find the ESP md device in case of a rebuild."""
+
+    # find devices of type 'RAID1' and fstype 'VFAT'
+    lsblk = utils.execute('lsblk', '-PbioNAME,TYPE,FSTYPE')
+    report = lsblk[0]
+    for line in report.split('\n'):
+        dev = {}
+        vals = shlex.split(line)
+        for key, val in (v.split('=', 1) for v in vals):
+            dev[key] = val.strip()
+        if dev.get('TYPE') == 'raid1' and dev.get('FSTYPE') == 'vfat':
+            return '/dev/' + dev.get('NAME')

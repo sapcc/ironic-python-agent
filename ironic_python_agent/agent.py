@@ -13,20 +13,20 @@
 # limitations under the License.
 
 import collections
+import importlib.metadata
 import ipaddress
+import os
 import random
 import socket
 import threading
 import time
 from urllib import parse as urlparse
 
-import eventlet
-from ironic_lib import exception as lib_exc
-from ironic_lib import mdns
+import requests
+
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log
-import pkg_resources
 
 from ironic_python_agent.api import app
 from ironic_python_agent import config
@@ -36,8 +36,11 @@ from ironic_python_agent.extensions import base
 from ironic_python_agent import hardware
 from ironic_python_agent import inspector
 from ironic_python_agent import ironic_api_client
+from ironic_python_agent import mdns
+from ironic_python_agent import netutils
 from ironic_python_agent import utils
 
+CONF = cfg.CONF
 LOG = log.getLogger(__name__)
 
 # Time(in seconds) to wait for any of the interfaces to be up
@@ -46,9 +49,6 @@ NETWORK_WAIT_TIMEOUT = 60
 
 # Time(in seconds) to wait before reattempt
 NETWORK_WAIT_RETRY = 5
-
-cfg.CONF.import_group('metrics', 'ironic_lib.metrics_utils')
-cfg.CONF.import_group('metrics_statsd', 'ironic_lib.metrics_statsd')
 
 Host = collections.namedtuple('Host', ['hostname', 'port'])
 
@@ -68,14 +68,24 @@ class IronicPythonAgentStatus(encoding.Serializable):
         self.version = version
 
 
+def _with_jitter(value, min_multiplier, max_multiplier):
+    interval_multiplier = random.uniform(min_multiplier, max_multiplier)
+    return value * interval_multiplier
+
+
 class IronicPythonAgentHeartbeater(threading.Thread):
     """Thread that periodically heartbeats to Ironic."""
 
-    # If we could wait at most N seconds between heartbeats (or in case of an
-    # error) we will instead wait r x N seconds, where r is a random value
-    # between these multipliers.
+    # If we could wait at most N seconds between heartbeats, we will instead
+    # wait r x N seconds, where r is a random value between these multipliers.
     min_jitter_multiplier = 0.3
     max_jitter_multiplier = 0.6
+    # Error retry between 5 and 10 seconds, at least 12 retries with
+    # the default ramdisk_heartbeat_timeout of 300 and the worst case interval
+    # jitter of 0.6.
+    min_heartbeat_interval = 5
+    min_error_jitter_multiplier = 1.0
+    max_error_jitter_multiplier = 2.0
 
     def __init__(self, agent):
         """Initialize the heartbeat thread.
@@ -97,19 +107,39 @@ class IronicPythonAgentHeartbeater(threading.Thread):
         LOG.info('Starting heartbeater')
         self.agent.set_agent_advertise_addr()
 
-        while not self.stop_event.wait(min(self.interval, 5)):
-            if self._heartbeat_expected():
-                self.do_heartbeat()
-            eventlet.sleep(0)
+        while self._run_next():
+            time.sleep(0.1)
+
+    def _run_next(self):
+        # The logic here makes sure we don't wait exactly 5 seconds more or
+        # less regardless of the current interval since it may cause a
+        # thundering herd problem when a lot of agents are heartbeating.
+        # Essentially, if the next heartbeat is due in 2 seconds, don't wait 5.
+        # But if the next one is scheduled in 2 minutes, do wait 5 to account
+        # for forced heartbeats.
+        wait = min(
+            self.min_heartbeat_interval,
+            # This operation checks how much of the initially planned interval
+            # we have still left. Compare with 0 in case we overshoot the goal.
+            max(0, self.interval - (_time() - self.previous_heartbeat)),
+        )
+        if self.stop_event.wait(wait):
+            return False  # done
+
+        if self._heartbeat_expected():
+            self.do_heartbeat()
+
+        return True
 
     def _heartbeat_expected(self):
+        elapsed = _time() - self.previous_heartbeat
+
         # Normal heartbeating
-        if _time() > self.previous_heartbeat + self.interval:
+        if elapsed >= self.interval:
             return True
 
         # Forced heartbeating, but once in 5 seconds
-        if (self.heartbeat_forced
-                and _time() > self.previous_heartbeat + 5):
+        if self.heartbeat_forced and elapsed > self.min_heartbeat_interval:
             return True
 
     def do_heartbeat(self):
@@ -121,20 +151,24 @@ class IronicPythonAgentHeartbeater(threading.Thread):
                 advertise_protocol=self.agent.advertise_protocol,
                 generated_cert=self.agent.generated_cert,
             )
-            LOG.info('heartbeat successful')
+        except Exception as exc:
+            if isinstance(exc, errors.HeartbeatConflictError):
+                LOG.warning('conflict error sending heartbeat to %s',
+                            self.agent.api_urls)
+            else:
+                LOG.exception('error sending heartbeat to %s',
+                              self.agent.api_urls)
+            self.interval = _with_jitter(self.min_heartbeat_interval,
+                                         self.min_error_jitter_multiplier,
+                                         self.max_error_jitter_multiplier)
+        else:
+            LOG.debug('heartbeat successful')
             self.heartbeat_forced = False
-            self.previous_heartbeat = _time()
-        except errors.HeartbeatConflictError:
-            LOG.warning('conflict error sending heartbeat to %s',
-                        self.agent.api_url)
-        except Exception:
-            LOG.exception('error sending heartbeat to %s', self.agent.api_url)
-        finally:
-            interval_multiplier = random.uniform(self.min_jitter_multiplier,
-                                                 self.max_jitter_multiplier)
-            self.interval = self.agent.heartbeat_timeout * interval_multiplier
-            LOG.info('sleeping before next heartbeat, interval: %s',
-                     self.interval)
+            self.interval = _with_jitter(self.agent.heartbeat_timeout,
+                                         self.min_jitter_multiplier,
+                                         self.max_jitter_multiplier)
+        self.previous_heartbeat = _time()
+        LOG.info('sleeping before next heartbeat, interval: %s', self.interval)
 
     def force_heartbeat(self):
         self.heartbeat_forced = True
@@ -143,11 +177,31 @@ class IronicPythonAgentHeartbeater(threading.Thread):
         """Stop the heartbeat thread."""
         LOG.info('stopping heartbeater')
         self.stop_event.set()
-        return self.join()
+        # Only join if the thread was actually started
+        if self.is_alive():
+            return self.join()
+        return None
 
 
 class IronicPythonAgent(base.ExecuteCommandMixin):
     """Class for base agent functionality."""
+
+    @classmethod
+    def from_config(cls, conf):
+        return cls(conf.api_url,
+                   Host(hostname=conf.advertise_host,
+                        port=conf.advertise_port),
+                   Host(hostname=conf.listen_host,
+                        port=conf.listen_port),
+                   conf.ip_lookup_attempts,
+                   conf.ip_lookup_sleep,
+                   conf.network_interface,
+                   conf.lookup_timeout,
+                   conf.lookup_interval,
+                   False,
+                   conf.agent_token,
+                   conf.hardware_initialization_delay,
+                   conf.advertise_protocol)
 
     def __init__(self, api_url, advertise_address, listen_address,
                  ip_lookup_attempts, ip_lookup_sleep, network_interface,
@@ -158,12 +212,11 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
             LOG.warning("Only one of 'keyfile' and 'certfile' options is "
                         "defined in config file. Its value will be ignored.")
         self.ext_mgr = base.init_ext_manager(self)
-        self.api_url = api_url
-        if (not self.api_url or self.api_url == 'mdns') and not standalone:
+        if (not api_url or api_url == 'mdns') and not standalone:
             try:
-                self.api_url, params = mdns.get_endpoint('baremetal')
-            except lib_exc.ServiceLookupFailure:
-                if self.api_url:
+                api_url, params = mdns.get_endpoint('baremetal')
+            except errors.ServiceLookupFailure:
+                if api_url:
                     # mDNS explicitly requested, report failure.
                     raise
                 else:
@@ -173,15 +226,17 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
                                 'will not heartbeat')
             else:
                 config.override(params)
-
-        if self.api_url:
-            self.api_client = ironic_api_client.APIClient(self.api_url)
+        if api_url:
+            self.api_urls = list(filter(None, api_url.split(',')))
+        else:
+            self.api_urls = None
+        if self.api_urls:
+            self.api_client = ironic_api_client.APIClient(self.api_urls)
             self.heartbeater = IronicPythonAgentHeartbeater(self)
         self.listen_address = listen_address
         self.advertise_address = advertise_address
         self.advertise_protocol = advertise_protocol
-        self.version = pkg_resources.get_distribution('ironic-python-agent')\
-            .version
+        self.version = importlib.metadata.version('ironic-python-agent')
         self.api = app.Application(self, cfg.CONF)
         self.heartbeat_timeout = None
         self.started_at = None
@@ -196,11 +251,13 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
         self.hardware_initialization_delay = hardware_initialization_delay
         # IPA will stop serving requests and exit after this is set to False
         self.serve_api = True
+        # Together with serve_api, this option allows locking down the system
+        # before IPA stops.
+        self.lockdown = False
         self.agent_token = agent_token
         # Allows this to be turned on by the conductor while running,
         # in the event of long running ramdisks where the conductor
         # got upgraded somewhere along the way.
-        self.agent_token_required = cfg.CONF.agent_token_required
         self.generated_cert = None
 
     def get_status(self):
@@ -216,19 +273,11 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
 
     def validate_agent_token(self, token):
         # We did not get a token, i.e. None and
-        # we've previously seen a token, which is
-        # a mid-cluster upgrade case with long-running ramdisks.
-        if (not token and self.agent_token
-                and not self.agent_token_required):
-            # TODO(TheJulia): Rip this out during or after the V cycle.
-            LOG.warning('Agent token for requests are not required '
-                        'by the conductor, yet we received a token. '
-                        'Cluster may be mid-upgrade. Support to '
-                        'not fail in this condition will be removed in '
-                        'the Victoria development cycle.')
-            # Tell the API everything is okay.
-            return True
-
+        # or we've not seen a token yet, so we
+        # cannot make a comparison, thus False.
+        if (not token or not self.agent_token):
+            return False
+        # Otherwise, compare the values.
         return self.agent_token == token
 
     def _get_route_source(self, dest):
@@ -259,6 +308,76 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
 
         return source
 
+    def _test_ip_reachability(self, ip_address):
+        """Test if an IP address is reachable via HTTP GET request.
+
+        :param ip_address: The IP address to test
+        :returns: True if the IP is reachable, False otherwise
+        """
+        test_urls = [
+            'http://{}'.format(ip_address),
+            'https://{}'.format(ip_address),
+        ]
+
+        for url in test_urls:
+            try:
+                # Disable SSL verification for reachability testing only
+                response = requests.get(
+                    url, timeout=CONF.http_request_timeout, verify=False
+                )  # nosec
+                # Any HTTP response (even 404, 500, etc.) indicates
+                # reachability
+                LOG.debug('IP %s is reachable via %s (status: %s)',
+                          ip_address, url, response.status_code)
+                return True
+            except requests.exceptions.RequestException as e:
+                LOG.debug('IP %s not reachable via %s: %s',
+                          ip_address, url, e)
+                continue
+
+        return False
+
+    def _find_routable_addr(self):
+        # Process API URLs: check reachability and collect IPs in one pass
+        reachable_api_urls = []
+        ips = set()
+
+        for api_url in self.api_urls:
+            ironic_host = urlparse.urlparse(api_url).hostname
+
+            # Test reachability once per hostname
+            if self._test_ip_reachability(ironic_host):
+                reachable_api_urls.append(api_url)
+                LOG.debug('API URL %s is reachable', api_url)
+
+                # Collect IPs for reachable hosts
+                try:
+                    addrs = socket.getaddrinfo(ironic_host, 0)
+                    ips.update(addr for _, _, _, _, (addr, *_) in addrs)
+                except socket.gaierror:
+                    LOG.debug('Could not resolve %s, maybe no DNS',
+                              ironic_host)
+                    ips.add(ironic_host)
+            else:
+                LOG.debug('API URL %s is not reachable, skipping', api_url)
+
+        # Update api_urls configuration to only include reachable endpoints
+        if reachable_api_urls:
+            LOG.info('Filtered API URLs from %d to %d reachable endpoints',
+                     len(self.api_urls), len(reachable_api_urls))
+            self.api_urls = reachable_api_urls
+        else:
+            LOG.warning('No reachable Ironic API URLs found, keeping all URLs')
+
+        # Find routable address using collected IPs
+        for attempt in range(self.ip_lookup_attempts):
+            for ironic_host in ips:
+                found_ip = self._get_route_source(ironic_host)
+                if found_ip:
+                    return found_ip
+
+            time.sleep(self.ip_lookup_sleep)
+
     def set_agent_advertise_addr(self):
         """Set advertised IP address for the agent, if not already set.
 
@@ -277,20 +396,7 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
             found_ip = hardware.dispatch_to_managers('get_ipv4_addr',
                                                      self.network_interface)
         else:
-            url = urlparse.urlparse(self.api_url)
-            ironic_host = url.hostname
-            # Try resolving it in case it's not an IP address
-            try:
-                ironic_host = socket.gethostbyname(ironic_host)
-            except socket.gaierror:
-                LOG.debug('Count not resolve %s, maybe no DNS', ironic_host)
-
-            for attempt in range(self.ip_lookup_attempts):
-                found_ip = self._get_route_source(ironic_host)
-                if found_ip:
-                    break
-
-                time.sleep(self.ip_lookup_sleep)
+            found_ip = self._find_routable_addr()
 
         if found_ip:
             self.advertise_address = Host(hostname=found_ip,
@@ -363,7 +469,7 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
             LOG.debug('Automated TLS is disabled')
             return None, None
 
-        if not self.api_url or not self.api_client.supports_auto_tls():
+        if not self.api_urls or not self.api_client.supports_auto_tls():
             LOG.warning('Ironic does not support automated TLS')
             return None, None
 
@@ -381,12 +487,12 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
         """Serve the API until an extension terminates it."""
         cert_file, key_file = self._start_auto_tls()
         self.api.start(cert_file, key_file)
-        if not self.standalone and self.api_url:
+        if not self.standalone and self.api_urls:
             # Don't start heartbeating until the server is listening
             self.heartbeater.start()
         try:
             while self.serve_api:
-                eventlet.sleep(0.1)
+                time.sleep(0.1)
         except KeyboardInterrupt:
             LOG.info('Caught keyboard interrupt, exiting')
         self.api.stop()
@@ -402,14 +508,24 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
 
         # Update config with values from Ironic
         config = content.get('config', {})
+        if config.get('agent_containers'):
+            for opt, val in config['agent_containers'].items():
+                cfg.CONF.set_override(opt, val, group='container')
         if config.get('metrics'):
             for opt, val in config.items():
                 setattr(cfg.CONF.metrics, opt, val)
         if config.get('metrics_statsd'):
             for opt, val in config.items():
                 setattr(cfg.CONF.metrics_statsd, opt, val)
-        if config.get('agent_token_required'):
-            self.agent_token_required = True
+        if config.get('disable_deep_image_inspection') is not None:
+            cfg.CONF.set_override('disable_deep_image_inspection',
+                                  config['disable_deep_image_inspection'])
+        if config.get('permitted_image_formats') is not None:
+            cfg.CONF.set_override('permitted_image_formats',
+                                  config['permitted_image_formats'])
+        md5_allowed = config.get('agent_md5_checksum_enable')
+        if md5_allowed is not None:
+            cfg.CONF.set_override('md5_enabled', md5_allowed)
         token = config.get('agent_token')
         if token:
             if len(token) >= 32:
@@ -425,11 +541,15 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
                             'intended and the deployment may fail '
                             'depending on settings in the ironic '
                             'deployment.')
-                if not self.agent_token and self.agent_token_required:
-                    LOG.error('Ironic is signaling that agent tokens '
-                              'are required, however we do not have '
-                              'a token on file. '
-                              'This is likely **FATAL**.')
+                if not self.agent_token:
+                    LOG.error('We do not have a token on file '
+                              'from the Ironic deployment, and '
+                              'one should be on file. '
+                              'Possible external agent restart '
+                              'outside of Ironic\'s process. '
+                              'This is **FATAL**.')
+                    self.serve_api = False
+                    self.lockdown = True
             else:
                 LOG.info('An invalid token was received.')
         if self.agent_token and not self.standalone:
@@ -464,7 +584,7 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
             # interfaces to perform those actions over.
             self._wait_for_interface()
 
-            if cfg.CONF.inspection_callback_url:
+            if self.api_urls or cfg.CONF.inspection_callback_url:
                 try:
                     # Attempt inspection. This may fail, and previously
                     # an error would be logged.
@@ -472,7 +592,7 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
                 except errors.InspectionError as e:
                     LOG.error('Failed to perform inspection: %s', e)
 
-            if self.api_url:
+            if self.api_urls:
                 content = self.api_client.lookup_node(
                     hardware_info=hardware.list_hardware_info(use_cache=True),
                     timeout=self.lookup_timeout,
@@ -495,7 +615,39 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
                 LOG.error('Neither ipa-api-url nor inspection_callback_url'
                           'found, please check your pxe append parameters.')
 
-        self.serve_ipa_api()
+        in_rescued_mode = os.path.exists('/etc/.rescued')
+        if not in_rescued_mode and self.serve_api:
+            self.serve_ipa_api()
+        else:
+            # NOTE(cid): In rescued state, we don't call _lockdown_system() as
+            # it brings down network interfaces which should be preserved for
+            # rescue operations.
+            LOG.info('Found rescue state marker file, locking down IPA '
+                     'in disabled mode')
+            if hasattr(self, 'heartbeater') and self.heartbeater.is_alive():
+                self.heartbeater.stop()
+            self.serve_api = False
+            while True:
+                time.sleep(100)
 
-        if not self.standalone and self.api_url:
-            self.heartbeater.stop()
+        if not self.standalone and self.api_urls:
+            if hasattr(self, 'heartbeater') and self.heartbeater.is_alive():
+                self.heartbeater.stop()
+
+        if self.lockdown:
+            self._lockdown_system()
+            LOG.info('System locked down, looping forever to avoid a service '
+                     'restart')
+            while True:
+                time.sleep(100)
+
+    def _lockdown_system(self):
+        LOG.info('Locking down system after the API stopped')
+        # NOTE(dtantsur): not going through hardware managers here to minimize
+        # the amount of operations.
+        for iface in netutils.list_interfaces():
+            try:
+                utils.execute('ip', 'link', 'set', iface, 'down')
+            except Exception as exc:
+                LOG.warning('Could not bring down interface %s: %s',
+                            iface, exc)

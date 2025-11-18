@@ -10,13 +10,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import crypt
-
 from oslo_log import log
+from oslo_utils import secretutils
 
 from ironic_python_agent.extensions import base
 
-LOG = log.getLogger()
+LOG = log.getLogger(__name__)
 
 PASSWORD_FILE = '/etc/ipa-rescue-config/ipa-rescue-password'
 
@@ -43,7 +42,8 @@ class RescueExtension(base.BaseAgentExtension):
         if hashed:
             hashed_password = password
         else:
-            hashed_password = crypt.crypt(rescue_password)
+            hashed_password = secretutils.crypt_password(
+                rescue_password, secretutils.crypt_mksalt('SHA-256'))
         try:
             with open(PASSWORD_FILE, 'w') as f:
                 f.write(hashed_password)
@@ -57,6 +57,12 @@ class RescueExtension(base.BaseAgentExtension):
     def finalize_rescue(self, rescue_password="", hashed=False):
         """Sets the rescue password for the rescue user."""
         self.write_rescue_password(rescue_password, hashed)
+
+        try:
+            open('/etc/.rescued', 'w')
+        except Exception as exc:
+            LOG.warning('Failed to create rescue state file marker: %s', exc)
+
         # IPA will terminate after the result of finalize_rescue is returned to
         # ironic to avoid exposing the IPA API to a tenant or public network
         self.agent.serve_api = False

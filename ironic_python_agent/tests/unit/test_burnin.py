@@ -11,8 +11,8 @@
 #    under the License.
 
 from unittest import mock
+from unittest.mock import call
 
-from ironic_lib import utils
 from oslo_concurrency import processutils
 from tooz import coordination
 
@@ -20,6 +20,7 @@ from ironic_python_agent import burnin
 from ironic_python_agent import errors
 from ironic_python_agent import hardware
 from ironic_python_agent.tests.unit import base
+from ironic_python_agent import utils
 
 
 SMART_OUTPUT_JSON_COMPLETED = ("""
@@ -94,7 +95,6 @@ class TestBurnin(base.IronicAgentTest):
                           burnin.stress_ng_cpu, node)
 
     def test_stress_ng_vm_default(self, mock_execute):
-
         node = {'driver_info': {}}
         mock_execute.return_value = (['out', 'err'])
 
@@ -102,8 +102,8 @@ class TestBurnin(base.IronicAgentTest):
 
         mock_execute.assert_called_once_with(
 
-            'stress-ng', '--vm', 0, '--vm-bytes', '98%',
-            '--timeout', 86400, '--metrics-brief')
+            'stress-ng', '--vm', 0, '--timeout', 86400, '--vm-bytes', '98%',
+            '--metrics-brief')
 
     def test_stress_ng_vm_non_default(self, mock_execute):
 
@@ -117,9 +117,8 @@ class TestBurnin(base.IronicAgentTest):
         burnin.stress_ng_vm(node)
 
         mock_execute.assert_called_once_with(
-            'stress-ng', '--vm', 2, '--vm-bytes', '25%',
-            '--timeout', 120, '--metrics-brief',
-            '--log-file', '/var/log/burnin.vm')
+            'stress-ng', '--vm', 2, '--timeout', 120, '--vm-bytes', '25%',
+            '--metrics-brief', '--log-file', '/var/log/burnin.vm')
 
     def test_stress_ng_vm_no_stress_ng(self, mock_execute):
 
@@ -464,7 +463,7 @@ class TestBurnin(base.IronicAgentTest):
 
         # we are the first node to enter, so no other host
         # initially until the second one appears after some
-        # interations
+        # iterations
         mock_coordinator.get_members.side_effect = \
             [Members(), Members([b'host1']), Members([b'host1']),
              Members([b'host1']), Members([b'host1', b'host2'])]
@@ -515,3 +514,38 @@ class TestBurnin(base.IronicAgentTest):
         # get_members is called initially, then every second until the
         # other node appears
         self.assertEqual(3, mock_coordinator.get_members.call_count)
+
+
+def test_gpu_burn_default(self, mock_execute):
+    node = {'driver_info': {}}
+    mock_execute.return_value = (['out', 'err'])
+    expected_calls = [call('./gpu_burn', '-l', cwd='/opt/gpu-burn'),
+                      call('./gpu_burn', '-m', '95%', 86400,
+                           cwd='/opt/gpu-burn')]
+
+    burnin.gpu_burn(node)
+
+    mock_execute.assert_has_calls(expected_calls, any_order=False)
+
+
+@mock.patch('ironic_python_agent.burnin.len', return_value=2, autospec=True)
+def test_gpu_burn_non_default(self, mock_gpu_burn_check_count, mock_execute):
+    node = {'driver_info': {
+        'agent_burnin_gpu_count': 2,
+        'agent_burnin_gpu_timeout': 3600}}
+    mock_execute.return_value = (['out', 'err'])
+    expected_calls = [call('./gpu_burn', '-l', cwd='/opt/gpu-burn'),
+                      call('./gpu_burn', '-m', '95%', 3600,
+                           cwd='/opt/gpu-burn')]
+
+    burnin.gpu_burn(node)
+
+    mock_execute.assert_has_calls(expected_calls, any_order=False)
+
+
+def test_gpu_burn_no_package(self, mock_execute):
+    node = {'driver_info': {}}
+    mock_execute.side_effect = processutils.ProcessExecutionError()
+
+    self.assertRaises(errors.CommandExecutionError,
+                      burnin.gpu_burn, node)

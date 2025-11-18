@@ -15,26 +15,31 @@
 from oslo_config import cfg
 from oslo_log import log as logging
 
+from ironic_python_agent.metrics_lib.metrics_statsd import statsd_opts
+from ironic_python_agent.metrics_lib.metrics_utils import metrics_opts
 from ironic_python_agent import netutils
 from ironic_python_agent import utils
+
 
 LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 
 APARAMS = utils.get_agent_params()
 
-INSPECTION_DEFAULT_COLLECTOR = 'default,logs'
+INSPECTION_DEFAULT_COLLECTORS = 'default,logs'
 INSPECTION_DEFAULT_DHCP_WAIT_TIMEOUT = 60
 
 cli_opts = [
     cfg.StrOpt('api_url',
                default=APARAMS.get('ipa-api-url'),
                regex='^(mdns|http(s?):\\/\\/.+)',
-               help='URL of the Ironic API. '
+               help='URL(s) of the Ironic API. '
                     'Can be supplied as "ipa-api-url" kernel parameter.'
-                    'The value must start with either http:// or https://. '
+                    'The value(s) must start with either http:// or https://. '
                     'A special value "mdns" can be specified to fetch the '
-                    'URL using multicast DNS service discovery.'),
+                    'URL using multicast DNS service discovery. If several '
+                    'URLs are provided, all of them are tried until one '
+                    'does not return a connection error.'),
 
     cfg.StrOpt('global_request_id',
                default=APARAMS.get('ipa-global-request-id'),
@@ -55,16 +60,26 @@ cli_opts = [
                      'Can be supplied as "ipa-listen-port" kernel parameter.'),
 
     # This is intentionally not settable via kernel command line, as it
-    # requires configuration parameters from oslo_service which are not
-    # configurable over the command line and require files-on-disk.
+    # requires configuration parameters which are not configurable over
+    # the command line and require files-on-disk.
     # Operators who want to use this support should configure it statically
     # as part of a ramdisk build.
     cfg.BoolOpt('listen_tls',
                 default=False,
                 help='When true, IPA will host API behind TLS. You will also '
-                     'need to configure [ssl] group options for cert_file, '
-                     'key_file, and, if desired, ca_file to validate client '
-                     'certificates.'),
+                     'need to configure tls_cert_file option and tls_key_file '
+                     'option.'),
+
+    cfg.StrOpt('tls_cert_file',
+               help="Certificate file to use when starting "
+                    "the server securely.",
+               deprecated_group='ssl',
+               deprecated_name='cert_file'),
+    cfg.StrOpt('tls_key_file',
+               help="Private key file to use when starting "
+                    "the server securely.",
+               deprecated_group='ssl',
+               deprecated_name='key_file'),
 
     cfg.BoolOpt('enable_auto_tls',
                 default=True,
@@ -121,7 +136,7 @@ cli_opts = [
 
     cfg.IntOpt('lookup_timeout',
                min=0,
-               default=int(APARAMS.get('ipa-lookup-timeout', 300)),
+               default=int(APARAMS.get('ipa-lookup-timeout', 600)),
                help='The amount of time to retry the initial lookup '
                     'call to Ironic. After the timeout, the agent '
                     'will exit with a non-zero exit code. '
@@ -149,26 +164,28 @@ cli_opts = [
                 help='Whether IPA should attempt to receive LLDP packets for '
                      'each network interface it discovers in the inventory. '
                      'Can be supplied as "ipa-collect-lldp" '
-                     'kernel parameter.'),
+                     'kernel parameter.',
+                deprecated_for_removal=True,
+                deprecated_reason="Use the lldp collector instead"),
 
     cfg.StrOpt('inspection_callback_url',
                default=APARAMS.get('ipa-inspection-callback-url'),
-               help='Endpoint of ironic-inspector. If set, hardware inventory '
-                    'will be collected and sent to ironic-inspector '
-                    'on start up. '
+               help='Endpoint(s) to send inspection data to. If set, hardware '
+                    'inventory will be collected and sent there on start up. '
                     'A special value "mdns" can be specified to fetch the '
                     'URL using multicast DNS service discovery. '
                     'Can be supplied as "ipa-inspection-callback-url" '
-                    'kernel parameter.'),
+                    'kernel parameter. If the URL is not provided but '
+                    'inspection_collectors is not empty, the URL is detected '
+                    'from api_url.'),
 
     cfg.StrOpt('inspection_collectors',
-               default=APARAMS.get('ipa-inspection-collectors',
-                                   INSPECTION_DEFAULT_COLLECTOR),
+               default=APARAMS.get('ipa-inspection-collectors'),
                help='Comma-separated list of plugins providing additional '
-                    'hardware data for inspection, empty value gives '
-                    'a minimum required set of plugins. '
+                    'hardware data for inspection. The default are %s. '
                     'Can be supplied as "ipa-inspection-collectors" '
-                    'kernel parameter.'),
+                    'kernel parameter.'
+                    % INSPECTION_DEFAULT_COLLECTORS),
 
     cfg.IntOpt('inspection_dhcp_wait_timeout',
                min=0,
@@ -249,7 +266,7 @@ cli_opts = [
     cfg.StrOpt('ntp_server',
                default=APARAMS.get('ipa-ntp-server', None),
                help='Address of a single NTP server against which the '
-                    'agent should sync the hardware clock prior to '
+                    'agent should sync the system software clock prior to '
                     'rebooting to an instance.'),
     cfg.BoolOpt('fail_if_clock_not_set',
                 default=False,
@@ -260,12 +277,31 @@ cli_opts = [
                help='Pre-shared token to use when working with the '
                     'ironic API. This value is typically supplied by '
                     'ironic automatically.'),
-    cfg.BoolOpt('agent_token_required',
-                default=APARAMS.get('ipa-agent-token-required', False),
-                help='Control to enforce if API command requests should '
-                     'enforce token validation. The configuration provided '
-                     'by the conductor MAY override this and force this '
-                     'setting to be changed to True in memory.'),
+    cfg.StrOpt('image_server_user',
+               default=None,
+               help='Pre-shared username used in Basic Auth process '
+                    'against the http(s) server that hosts the disk image.'
+                    'This variable can be also configured via image_info.'
+                    'Value coming from image_info takes precedence over'
+                    'value coming from command line or configuration file.'),
+    cfg.StrOpt('image_server_password',
+               default=None,
+               help='Pre-shared password used in Basic Auth process '
+                    'against the http(s) server that hosts the disk image.'
+                    'This variable can be also configured via image_info.'
+                    'Value coming from image_info takes precedence over'
+                    'value coming from command line or configuration file.'),
+    cfg.StrOpt('image_server_auth_strategy',
+               default="noauth",
+               help='Option to select authentication strategy used during'
+                    'communication with the server that hosts the disk images'
+                    'and related checksums. This option also turns'
+                    'image_server_password and image_server_user'
+                    'into mandatory variables for those authentication'
+                    'strategies that require username + password credentials.'
+                    'This variable can be also configured via image_info.'
+                    'Value coming from image_info takes precedence over'
+                    'value coming from command line or configuration file.'),
     cfg.IntOpt('image_download_connection_timeout', min=1,
                default=APARAMS.get(
                    'ipa-image-download-connection-timeout', 60),
@@ -280,6 +316,13 @@ cli_opts = [
                    'ipa-image-download-connection-retry-interval', 10),
                help='Interval (in seconds) between two attempts to establish '
                     'connection when downloading an image.'),
+    cfg.IntOpt('image_download_max_duration', min=0,
+               default=int(APARAMS.get(
+                   'ipa-image-download-max-duration', 0)),
+               help='Maximum total duration (in seconds) allowed for '
+                    'downloading an image. If the download exceeds this '
+                    'duration, it will be aborted regardless of retry or '
+                    'connection success.'),
     cfg.StrOpt('ironic_api_version',
                default=APARAMS.get('ipa-ironic-api-version', None),
                help='Ironic API version in format "x.x". If not set, the API '
@@ -326,13 +369,136 @@ cli_opts = [
                      'cleaning from inadvertently destroying a running '
                      'cluster which may be visible over a storage fabric '
                      'such as FibreChannel.'),
+    cfg.BoolOpt('md5_enabled',
+                default=True,
+                help='If the MD5 algorithm is enabled for file checksums. '
+                     'Will be changed to False in the future.'),
+    cfg.IntOpt('http_request_timeout',
+               default=APARAMS.get('ipa-http-request-timeout', 30),
+               min=1,
+               help='Time in seconds to wait for an HTTP request TCP socket '
+                    'used by an API request to a remote service to enter '
+                    'a state where a request can be transmitted.'),
+    cfg.BoolOpt('config_drive_rebuild',
+                default=False,
+                help='If the agent should rebuild the configuration drive '
+                     'using a local filesystem, instead of letting Ironic '
+                     'determine if this action is necessary.'),
+    cfg.BoolOpt('disable_deep_image_inspection',
+                default=False,
+                help='This disables the additional deep image inspection '
+                     'the agent does before converting and writing an image. '
+                     'Generally, this should remain enabled for maximum '
+                     'security, but this option allows disabling it if there '
+                     'is a compatibility concern.'),
+    cfg.ListOpt('permitted_image_formats',
+                default='raw,gpt,qcow2',
+                help='The supported list of image formats which are '
+                     'permitted for deployment with Ironic Python Agent. If '
+                     'an image format outside of this list is detected, the '
+                     'image validation logic will fail the deployment '
+                     'process. This check is skipped if deep image '
+                     'inspection is disabled.'),
+    cfg.BoolOpt('disable_bootc_deploy',
+                default=False,
+                help='This disables bootc deployment methods in the ramdisk '
+                     'because the bootc command inside of the ramdisk '
+                     'comes from the supplied image to be deployed.'),
 ]
 
-CONF.register_cli_opts(cli_opts)
+disk_utils_opts = [
+    cfg.IntOpt('efi_system_partition_size',
+               default=550,
+               help='Size of EFI system partition in MiB when configuring '
+                    'UEFI systems for local boot. A common minimum is ~200 '
+                    'megabytes, however OS driven firmware updates and '
+                    'unikernel usage generally requires more space on the '
+                    'efi partition.'),
+    cfg.IntOpt('bios_boot_partition_size',
+               default=1,
+               help='Size of BIOS Boot partition in MiB when configuring '
+                    'GPT partitioned systems for local boot in BIOS.'),
+    cfg.StrOpt('dd_block_size',
+               default='1M',
+               help='Block size to use when writing to the nodes disk.'),
+    cfg.IntOpt('partition_detection_attempts',
+               default=3,
+               min=1,
+               help='Maximum attempts to detect a newly created partition.'),
+    cfg.IntOpt('partprobe_attempts',
+               default=10,
+               help='Maximum number of attempts to try to read the '
+                    'partition.'),
+    cfg.IntOpt('image_convert_memory_limit',
+               default=2048,
+               help='Memory limit for "qemu-img convert" in MiB. Implemented '
+                    'via the address space resource limit.'),
+    cfg.IntOpt('image_convert_attempts',
+               default=3,
+               help='Number of attempts to convert an image.'),
+]
+
+disk_part_opts = [
+    cfg.IntOpt('check_device_interval',
+               default=1,
+               help='After Ironic has completed creating the partition table, '
+                    'it continues to check for activity on the attached iSCSI '
+                    'device status at this interval prior to copying the image'
+                    ' to the node, in seconds'),
+    cfg.IntOpt('check_device_max_retries',
+               default=20,
+               help='The maximum number of times to check that the device is '
+                    'not accessed by another process. If the device is still '
+                    'busy after that, the disk partitioning will be treated as'
+                    ' having failed.')
+]
+
+container_opts = [
+    cfg.BoolOpt('allow_arbitrary_containers',
+                default=False,
+                help='Allow arbitrary containers to be run'
+                     'without restriction.'),
+    cfg.ListOpt('allowed_containers',
+                default=[],
+                help='List of allowed containers that can be run.'),
+    cfg.StrOpt('container_steps_file',
+               default='/etc/ironic-python-agent.d/mysteps.yaml',
+               help='Path to the YAML file containing container-based'
+                    'cleaning steps.'),
+    cfg.StrOpt('runner',
+               default='podman',
+               choices=['podman', 'docker'],
+               help='Container runtime to use for cleaning steps.'),
+    cfg.ListOpt('pull_options',
+                default=['--tls-verify=false'],
+                help='Options to use when pulling container images.'),
+    cfg.ListOpt('run_options',
+                default=['--rm', '--network=host', '--tls-verify=false'],
+                help='Options to use when running containers.'),
+    cfg.StrOpt('container_conf_file',
+               default='/etc/containers/containers.conf',
+               help='Path to the container configuration file in the IPA RAM')
+]
 
 
 def list_opts():
-    return [('DEFAULT', cli_opts)]
+    return [('DEFAULT', cli_opts),
+            ('disk_utils', disk_utils_opts),
+            ('disk_partitioner', disk_part_opts),
+            ('metrics', metrics_opts),
+            ('metrics_statsd', statsd_opts),
+            ('container', container_opts)
+            ]
+
+
+def populate_config():
+    """Populate configuration. In a method so tests can easily utilize it."""
+    CONF.register_cli_opts(cli_opts)
+    CONF.register_opts(disk_utils_opts, group='disk_utils')
+    CONF.register_opts(disk_part_opts, group='disk_partitioner')
+    CONF.register_opts(metrics_opts, group='metrics')
+    CONF.register_opts(statsd_opts, group='metrics_statsd')
+    CONF.register_opts(container_opts, group='container')
 
 
 def override(params):
@@ -359,3 +525,6 @@ def override(params):
             LOG.warning('Unable to override configuration option %(key)s '
                         'with %(value)r: %(exc)s',
                         {'key': key, 'value': value, 'exc': exc})
+
+
+populate_config()

@@ -15,10 +15,10 @@ import re
 import sys
 import tempfile
 
-from ironic_lib import disk_utils
 from oslo_concurrency import processutils
 from oslo_log import log
 
+from ironic_python_agent import disk_utils
 from ironic_python_agent import errors
 from ironic_python_agent import hardware
 from ironic_python_agent import partition_utils
@@ -63,7 +63,7 @@ def get_partition_path_by_number(device, part_num):
 def manage_uefi(device, efi_system_part_uuid=None):
     """Manage the device looking for valid efi bootloaders to update the nvram.
 
-    This method checks for valid efi bootloaders in the device, if they exists
+    This method checks for valid efi bootloaders in the device, if they exist
     it updates the nvram using the efibootmgr.
 
     :param device: the device to be checked.
@@ -267,19 +267,36 @@ def _get_efi_bootloaders(location):
 
 # NOTE(TheJulia): regex used to identify entries in the efibootmgr
 # output on stdout.
-_ENTRY_LABEL = re.compile(r'Boot([0-9a-f-A-F]+)\*?\s(.*).*$')
+_ENTRY_LABEL = re.compile(
+    r'Boot([0-9a-f-A-F]+)\*?\s+(.*?)\s+'
+    r'((BBS|HD|FvFile|FvVol|PciRoot|VenMsg|VenHw|UsbClass)\(.*)$')
 
 
 def get_boot_records():
     """Executes efibootmgr and returns boot records.
 
-    :return: an iterator yielding pairs (boot number, boot record).
+    :return: An iterator yielding tuples
+             (boot number, boot record, root device type, device path).
     """
-    efi_output = utils.execute('efibootmgr', '-v')
-    for line in efi_output[0].split('\n'):
+    # Invokes binary=True so we get a bytestream back.
+    efi_output = utils.execute('efibootmgr', '-v', binary=True)
+    # Bytes must be decoded before regex can be run and
+    # matching to work as intended.
+    # Also ignore errors on decoding, as we can basically get
+    # garbage out of the nvram record, this way we don't fail
+    # hard on unrelated records.
+    cmd_output = efi_output[0].decode('utf-16', errors='ignore').split('\n')
+    # Check that the output is encoded as UTF-16 otherwise try UTF-8.
+    _DETECT_ENCODING_STRING = "BootCurrent: "
+    for line in cmd_output:
+        if line.startswith(_DETECT_ENCODING_STRING):
+            break
+    else:
+        cmd_output = efi_output[0].decode('utf-8', errors='ignore').split('\n')
+    for line in cmd_output:
         match = _ENTRY_LABEL.match(line)
         if match is not None:
-            yield (match[1], match[2])
+            yield (match[1], match[2], match[4], match[3])
 
 
 def add_boot_record(device, efi_partition, loader, label):
@@ -293,7 +310,7 @@ def add_boot_record(device, efi_partition, loader, label):
     # https://linux.die.net/man/8/efibootmgr
     utils.execute('efibootmgr', '-v', '-c', '-d', device,
                   '-p', str(efi_partition), '-w', '-L', label,
-                  '-l', loader)
+                  '-l', loader, binary=True)
 
 
 def remove_boot_record(boot_num):
@@ -301,7 +318,24 @@ def remove_boot_record(boot_num):
 
     :param boot_num: the number of the boot record
     """
-    utils.execute('efibootmgr', '-b', boot_num, '-B')
+    utils.execute('efibootmgr', '-b', boot_num, '-B', binary=True)
+
+
+def clean_boot_records(patterns):
+    """Remove EFI boot records matching regex patterns.
+
+    :param match_patterns: A list of string regular expression patterns
+                            where any matching entry will be deleted.
+    """
+
+    for boot_num, entry, _, path in get_boot_records():
+        for pattern in patterns:
+            if pattern.search(path):
+                LOG.debug('Path %s matched pattern %s, '
+                          'entry will be deleted: %s',
+                          path, pattern.pattern, entry)
+                remove_boot_record(boot_num)
+                break
 
 
 def _run_efibootmgr(valid_efi_bootloaders, device, efi_partition,
@@ -351,11 +385,11 @@ def _run_efibootmgr(valid_efi_bootloaders, device, efi_partition,
                 label = label + " " + str(label_suffix)
 
         # Iterate through standard out, and look for duplicates
-        for boot_num, boot_rec in boot_records:
+        for boot_num, boot_rec, boot_type, boot_details in boot_records:
             # Look for the base label in the string if a line match
             # occurs, so we can identify if we need to eliminate the
             # entry.
-            if label in boot_rec:
+            if label == boot_rec:
                 LOG.debug("Found bootnum %s matching label", boot_num)
                 remove_boot_record(boot_num)
 

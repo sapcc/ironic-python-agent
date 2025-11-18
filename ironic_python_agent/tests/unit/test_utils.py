@@ -17,40 +17,98 @@ import base64
 import errno
 import glob
 import io
-import json
 import os
 import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from unittest import mock
 
-from ironic_lib import utils as ironic_utils
 from oslo_concurrency import processutils
 import requests
 import testtools
 
 from ironic_python_agent import errors
 from ironic_python_agent import hardware
-from ironic_python_agent.tests.unit import base as ironic_agent_base
+from ironic_python_agent.tests.unit import base
 from ironic_python_agent import utils
 
 
-class ExecuteTestCase(ironic_agent_base.IronicAgentTest):
-    # This test case does call utils.execute(), so don't block access to the
-    # execute calls.
-    block_execute = False
+@mock.patch('shutil.rmtree', autospec=True)
+@mock.patch.object(utils, 'execute', autospec=True)
+@mock.patch('tempfile.mkdtemp', autospec=True)
+class MountedTestCase(base.IronicAgentTest):
 
-    # We do mock out the call to ironic_utils.execute() so we don't actually
-    # 'execute' anything, as utils.execute() calls ironic_utils.execute()
-    @mock.patch.object(ironic_utils, 'execute', autospec=True)
-    def test_execute(self, mock_execute):
-        utils.execute('/usr/bin/env', 'false', check_exit_code=False)
-        mock_execute.assert_called_once_with('/usr/bin/env', 'false',
-                                             check_exit_code=False)
+    def test_temporary(self, mock_temp, mock_execute, mock_rmtree):
+        with utils.mounted('/dev/fake') as path:
+            self.assertIs(path, mock_temp.return_value)
+        mock_execute.assert_has_calls([
+            mock.call("mount", '/dev/fake', mock_temp.return_value,
+                      attempts=1, delay_on_retry=True),
+            mock.call("umount", mock_temp.return_value,
+                      attempts=3, delay_on_retry=True),
+        ])
+        mock_rmtree.assert_called_once_with(mock_temp.return_value)
+
+    def test_with_dest(self, mock_temp, mock_execute, mock_rmtree):
+        with utils.mounted('/dev/fake', '/mnt/fake') as path:
+            self.assertEqual('/mnt/fake', path)
+        mock_execute.assert_has_calls([
+            mock.call("mount", '/dev/fake', '/mnt/fake',
+                      attempts=1, delay_on_retry=True),
+            mock.call("umount", '/mnt/fake',
+                      attempts=3, delay_on_retry=True),
+        ])
+        self.assertFalse(mock_temp.called)
+        self.assertFalse(mock_rmtree.called)
+
+    def test_with_opts(self, mock_temp, mock_execute, mock_rmtree):
+        with utils.mounted('/dev/fake', '/mnt/fake',
+                           opts=['ro', 'foo=bar']) as path:
+            self.assertEqual('/mnt/fake', path)
+        mock_execute.assert_has_calls([
+            mock.call("mount", '/dev/fake', '/mnt/fake', '-o', 'ro,foo=bar',
+                      attempts=1, delay_on_retry=True),
+            mock.call("umount", '/mnt/fake',
+                      attempts=3, delay_on_retry=True),
+        ])
+
+    def test_with_type(self, mock_temp, mock_execute, mock_rmtree):
+        with utils.mounted('/dev/fake', '/mnt/fake',
+                           fs_type='iso9660') as path:
+            self.assertEqual('/mnt/fake', path)
+        mock_execute.assert_has_calls([
+            mock.call("mount", '/dev/fake', '/mnt/fake', '-t', 'iso9660',
+                      attempts=1, delay_on_retry=True),
+            mock.call("umount", '/mnt/fake',
+                      attempts=3, delay_on_retry=True),
+        ])
+
+    def test_failed_to_mount(self, mock_temp, mock_execute, mock_rmtree):
+        mock_execute.side_effect = OSError
+        self.assertRaises(OSError, utils.mounted('/dev/fake').__enter__)
+        mock_execute.assert_called_once_with("mount", '/dev/fake',
+                                             mock_temp.return_value,
+                                             attempts=1,
+                                             delay_on_retry=True)
+        mock_rmtree.assert_called_once_with(mock_temp.return_value)
+
+    def test_failed_to_unmount(self, mock_temp, mock_execute, mock_rmtree):
+        mock_execute.side_effect = [('', ''),
+                                    processutils.ProcessExecutionError]
+        with utils.mounted('/dev/fake', '/mnt/fake') as path:
+            self.assertEqual('/mnt/fake', path)
+        mock_execute.assert_has_calls([
+            mock.call("mount", '/dev/fake', '/mnt/fake',
+                      attempts=1, delay_on_retry=True),
+            mock.call("umount", '/mnt/fake',
+                      attempts=3, delay_on_retry=True),
+        ])
+        self.assertFalse(mock_rmtree.called)
 
 
-class GetAgentParamsTestCase(ironic_agent_base.IronicAgentTest):
+class GetAgentParamsTestCase(base.IronicAgentTest):
 
     @mock.patch('oslo_log.log.getLogger', autospec=True)
     @mock.patch('builtins.open', autospec=True)
@@ -187,7 +245,7 @@ class GetAgentParamsTestCase(ironic_agent_base.IronicAgentTest):
     @mock.patch.object(utils, '_check_vmedia_device', autospec=True)
     @mock.patch.object(utils, '_find_vmedia_device_by_labels', autospec=True)
     @mock.patch.object(utils, '_read_params_from_file', autospec=True)
-    @mock.patch.object(ironic_utils, 'mounted', autospec=True)
+    @mock.patch.object(utils, 'mounted', autospec=True)
     def test__get_vmedia_params(self, mount_mock, read_params_mock, find_mock,
                                 check_vmedia_mock):
         check_vmedia_mock.return_value = True
@@ -206,7 +264,7 @@ class GetAgentParamsTestCase(ironic_agent_base.IronicAgentTest):
     @mock.patch.object(utils, '_find_vmedia_device_by_labels', autospec=True)
     @mock.patch.object(utils, '_get_vmedia_device', autospec=True)
     @mock.patch.object(utils, '_read_params_from_file', autospec=True)
-    @mock.patch.object(ironic_utils, 'mounted', autospec=True)
+    @mock.patch.object(utils, 'mounted', autospec=True)
     def test__get_vmedia_params_by_device(self, mount_mock, read_params_mock,
                                           get_device_mock, find_mock,
                                           check_vmedia_mock):
@@ -228,7 +286,7 @@ class GetAgentParamsTestCase(ironic_agent_base.IronicAgentTest):
     @mock.patch.object(utils, '_find_vmedia_device_by_labels', autospec=True)
     @mock.patch.object(utils, '_get_vmedia_device', autospec=True)
     @mock.patch.object(utils, '_read_params_from_file', autospec=True)
-    @mock.patch.object(ironic_utils, 'mounted', autospec=True)
+    @mock.patch.object(utils, 'mounted', autospec=True)
     def test__get_vmedia_params_by_device_device_invalid(
             self, mount_mock, read_params_mock,
             get_device_mock, find_mock,
@@ -279,7 +337,7 @@ class TestFailures(testtools.TestCase):
         self.assertRaisesRegex(FakeException, 'foo', f.raise_if_needed)
 
 
-class TestUtils(ironic_agent_base.IronicAgentTest):
+class TestUtils(base.IronicAgentTest):
 
     def _get_journalctl_output(self, mock_execute, lines=None, units=None):
         contents = b'Krusty Krab'
@@ -411,14 +469,12 @@ class TestUtils(ironic_agent_base.IronicAgentTest):
         mock_call.side_effect = os_error
         self.assertFalse(utils.is_journalctl_present())
 
-    @mock.patch.object(utils, '_collect_udev', autospec=True)
     @mock.patch.object(utils, 'gzip_and_b64encode', autospec=True)
+    @mock.patch.object(hardware, 'dispatch_to_all_managers', autospec=True)
     @mock.patch.object(utils, 'is_journalctl_present', autospec=True)
-    @mock.patch.object(utils, 'get_command_output', autospec=True)
     @mock.patch.object(utils, 'get_journalctl_output', autospec=True)
     def test_collect_system_logs_journald(
-            self, mock_logs, mock_outputs, mock_journalctl, mock_gzip_b64,
-            mock_udev):
+            self, mock_logs, mock_journalctl, mock_dispatch, mock_gzip_b64):
         mock_journalctl.return_value = True
         ret = 'Patrick Star'
         mock_gzip_b64.return_value = ret
@@ -426,28 +482,17 @@ class TestUtils(ironic_agent_base.IronicAgentTest):
         logs_string = utils.collect_system_logs()
         self.assertEqual(ret, logs_string)
         mock_logs.assert_called_once_with(lines=None)
-        calls = [mock.call(['ps', 'au']), mock.call(['df', '-a']),
-                 mock.call(['iptables', '-L']), mock.call(['ip', 'addr']),
-                 mock.call(['lshw', '-quiet', '-json'])]
-        mock_outputs.assert_has_calls(calls, any_order=True)
         mock_gzip_b64.assert_called_once_with(
-            io_dict={'journal': mock.ANY, 'ps': mock.ANY, 'df': mock.ANY,
-                     'iptables': mock.ANY, 'ip_addr': mock.ANY,
-                     'lshw': mock.ANY, 'lsblk': mock.ANY,
-                     'lsblk-full': mock.ANY, 'mdstat': mock.ANY,
-                     'mount': mock.ANY, 'parted': mock.ANY,
-                     'multipath': mock.ANY},
-            file_list=[])
-        mock_udev.assert_called_once_with(mock.ANY)
+            io_dict=mock.ANY, file_list=[])
+        mock_dispatch.assert_called_once_with('collect_system_logs',
+                                              mock.ANY, [])
 
-    @mock.patch.object(utils, '_collect_udev', autospec=True)
     @mock.patch.object(utils, 'gzip_and_b64encode', autospec=True)
+    @mock.patch.object(hardware, 'dispatch_to_all_managers', autospec=True)
     @mock.patch.object(utils, 'is_journalctl_present', autospec=True)
-    @mock.patch.object(utils, 'get_command_output', autospec=True)
     @mock.patch.object(utils, 'get_journalctl_output', autospec=True)
     def test_collect_system_logs_journald_with_logfile(
-            self, mock_logs, mock_outputs, mock_journalctl, mock_gzip_b64,
-            mock_udev):
+            self, mock_logs, mock_journalctl, mock_dispatch, mock_gzip_b64):
         tmp = tempfile.NamedTemporaryFile()
         self.addCleanup(lambda: tmp.close())
 
@@ -459,55 +504,32 @@ class TestUtils(ironic_agent_base.IronicAgentTest):
         logs_string = utils.collect_system_logs()
         self.assertEqual(ret, logs_string)
         mock_logs.assert_called_once_with(lines=None)
-        calls = [mock.call(['ps', 'au']), mock.call(['df', '-a']),
-                 mock.call(['iptables', '-L']), mock.call(['ip', 'addr']),
-                 mock.call(['lshw', '-quiet', '-json'])]
-        mock_outputs.assert_has_calls(calls, any_order=True)
         mock_gzip_b64.assert_called_once_with(
-            io_dict={'journal': mock.ANY, 'ps': mock.ANY, 'df': mock.ANY,
-                     'iptables': mock.ANY, 'ip_addr': mock.ANY,
-                     'lshw': mock.ANY, 'lsblk': mock.ANY,
-                     'lsblk-full': mock.ANY, 'mdstat': mock.ANY,
-                     'mount': mock.ANY, 'parted': mock.ANY,
-                     'multipath': mock.ANY},
-            file_list=[tmp.name])
-        mock_udev.assert_called_once_with(mock.ANY)
+            io_dict=mock.ANY, file_list=[tmp.name])
+        mock_dispatch.assert_called_once_with('collect_system_logs',
+                                              mock.ANY, [tmp.name])
 
-    @mock.patch.object(utils, '_collect_udev', autospec=True)
     @mock.patch.object(utils, 'gzip_and_b64encode', autospec=True)
+    @mock.patch.object(hardware, 'dispatch_to_all_managers', autospec=True)
     @mock.patch.object(utils, 'is_journalctl_present', autospec=True)
-    @mock.patch.object(utils, 'get_command_output', autospec=True)
     def test_collect_system_logs_non_journald(
-            self, mock_outputs, mock_journalctl, mock_gzip_b64,
-            mock_udev):
+            self, mock_journalctl, mock_dispatch, mock_gzip_b64):
         mock_journalctl.return_value = False
         ret = 'SpongeBob SquarePants'
         mock_gzip_b64.return_value = ret
 
         logs_string = utils.collect_system_logs()
         self.assertEqual(ret, logs_string)
-        calls = [mock.call(['dmesg']), mock.call(['ps', 'au']),
-                 mock.call(['df', '-a']), mock.call(['iptables', '-L']),
-                 mock.call(['ip', 'addr']),
-                 mock.call(['lshw', '-quiet', '-json'])]
-        mock_outputs.assert_has_calls(calls, any_order=True)
         mock_gzip_b64.assert_called_once_with(
-            io_dict={'dmesg': mock.ANY, 'ps': mock.ANY, 'df': mock.ANY,
-                     'iptables': mock.ANY, 'ip_addr': mock.ANY,
-                     'lshw': mock.ANY, 'lsblk': mock.ANY,
-                     'lsblk-full': mock.ANY, 'mdstat': mock.ANY,
-                     'mount': mock.ANY, 'parted': mock.ANY,
-                     'multipath': mock.ANY},
-            file_list=['/var/log'])
-        mock_udev.assert_called_once_with(mock.ANY)
+            io_dict=mock.ANY, file_list=['/var/log'])
+        mock_dispatch.assert_called_once_with('collect_system_logs',
+                                              mock.ANY, ['/var/log'])
 
-    @mock.patch.object(utils, '_collect_udev', autospec=True)
     @mock.patch.object(utils, 'gzip_and_b64encode', autospec=True)
+    @mock.patch.object(hardware, 'dispatch_to_all_managers', autospec=True)
     @mock.patch.object(utils, 'is_journalctl_present', autospec=True)
-    @mock.patch.object(utils, 'get_command_output', autospec=True)
     def test_collect_system_logs_non_journald_with_logfile(
-            self, mock_outputs, mock_journalctl, mock_gzip_b64,
-            mock_udev):
+            self, mock_journalctl, mock_dispatch, mock_gzip_b64):
         tmp = tempfile.NamedTemporaryFile()
         self.addCleanup(lambda: tmp.close())
 
@@ -518,44 +540,10 @@ class TestUtils(ironic_agent_base.IronicAgentTest):
 
         logs_string = utils.collect_system_logs()
         self.assertEqual(ret, logs_string)
-        calls = [mock.call(['dmesg']), mock.call(['ps', 'au']),
-                 mock.call(['df', '-a']), mock.call(['iptables', '-L']),
-                 mock.call(['ip', 'addr']),
-                 mock.call(['lshw', '-quiet', '-json'])]
-        mock_outputs.assert_has_calls(calls, any_order=True)
         mock_gzip_b64.assert_called_once_with(
-            io_dict={'dmesg': mock.ANY, 'ps': mock.ANY, 'df': mock.ANY,
-                     'iptables': mock.ANY, 'ip_addr': mock.ANY,
-                     'lshw': mock.ANY, 'lsblk': mock.ANY,
-                     'lsblk-full': mock.ANY, 'mdstat': mock.ANY,
-                     'mount': mock.ANY, 'parted': mock.ANY,
-                     'multipath': mock.ANY},
-            file_list=['/var/log', tmp.name])
-        mock_udev.assert_called_once_with(mock.ANY)
-
-    @mock.patch('pyudev.Context', lambda: mock.sentinel.context)
-    @mock.patch('pyudev.Devices.from_device_file', autospec=True)
-    @mock.patch.object(ironic_utils, 'execute', autospec=True)
-    def test_collect_udev(self, mock_execute, mock_from_dev):
-        mock_execute.return_value = """
-            fake0
-            fake1
-            fake42
-        """, ""
-        mock_from_dev.side_effect = [
-            mock.Mock(properties={'ID_UUID': '0'}),
-            RuntimeError('nope'),
-            {'ID_UUID': '42'}
-        ]
-
-        result = {}
-        utils._collect_udev(result)
-        self.assertEqual({'udev/fake0', 'udev/fake42'}, set(result))
-        for i in ('0', '42'):
-            buf = result[f'udev/fake{i}']
-            # Avoiding getvalue on purpose - checking that the IO is not closed
-            val = json.loads(buf.read().decode('utf-8'))
-            self.assertEqual({'ID_UUID': i}, val)
+            io_dict=mock.ANY, file_list=['/var/log', tmp.name])
+        mock_dispatch.assert_called_once_with('collect_system_logs',
+                                              mock.ANY, ['/var/log', tmp.name])
 
     def test_get_ssl_client_options(self):
         # defaults
@@ -867,7 +855,7 @@ class TestRemoveKeys(testtools.TestCase):
 
 
 @mock.patch.object(utils, 'execute', autospec=True)
-class TestClockSyncUtils(ironic_agent_base.IronicAgentTest):
+class TestClockSyncUtils(base.IronicAgentTest):
 
     def test_determine_time_method_none(self, mock_execute):
         mock_execute.side_effect = OSError
@@ -948,17 +936,19 @@ class TestClockSyncUtils(ironic_agent_base.IronicAgentTest):
         self.assertEqual(0, mock_execute.call_count)
 
 
+@mock.patch.object(utils, '_unmount_any_config_drives', autospec=True)
 @mock.patch.object(utils, '_booted_from_vmedia', autospec=True)
 @mock.patch.object(utils, '_check_vmedia_device', autospec=True)
 @mock.patch.object(utils, '_find_vmedia_device_by_labels', autospec=True)
 @mock.patch.object(shutil, 'copy', autospec=True)
-@mock.patch.object(ironic_utils, 'mounted', autospec=True)
+@mock.patch.object(utils, 'mounted', autospec=True)
 @mock.patch.object(utils, 'execute', autospec=True)
 class TestCopyConfigFromVmedia(testtools.TestCase):
 
     def test_vmedia_found_not_booted_from_vmedia(
             self, mock_execute, mock_mount, mock_copy,
-            mock_find_device, mock_check_vmedia, mock_booted_from_vmedia):
+            mock_find_device, mock_check_vmedia, mock_booted_from_vmedia,
+            mock_unmount_config):
         mock_booted_from_vmedia.return_value = False
         mock_find_device.return_value = '/dev/fake'
         utils.copy_config_from_vmedia()
@@ -967,10 +957,12 @@ class TestCopyConfigFromVmedia(testtools.TestCase):
         mock_copy.assert_not_called()
         mock_check_vmedia.assert_not_called()
         self.assertTrue(mock_booted_from_vmedia.called)
+        self.assertTrue(mock_unmount_config.called)
 
     def test_no_vmedia(
             self, mock_execute, mock_mount, mock_copy,
-            mock_find_device, mock_check_vmedia, mock_booted_from_vmedia):
+            mock_find_device, mock_check_vmedia, mock_booted_from_vmedia,
+            mock_unmount_config):
         mock_booted_from_vmedia.return_value = True
         mock_find_device.return_value = None
         utils.copy_config_from_vmedia()
@@ -979,10 +971,12 @@ class TestCopyConfigFromVmedia(testtools.TestCase):
         mock_copy.assert_not_called()
         mock_check_vmedia.assert_not_called()
         self.assertFalse(mock_booted_from_vmedia.called)
+        self.assertTrue(mock_unmount_config.called)
 
     def test_no_files(
             self, mock_execute, mock_mount, mock_copy,
-            mock_find_device, mock_check_vmedia, mock_booted_from_vmedia):
+            mock_find_device, mock_check_vmedia, mock_booted_from_vmedia,
+            mock_unmount_config):
         mock_booted_from_vmedia.return_value = True
         temp_path = tempfile.mkdtemp()
         self.addCleanup(lambda: shutil.rmtree(temp_path))
@@ -996,10 +990,12 @@ class TestCopyConfigFromVmedia(testtools.TestCase):
                                              '/dev/something')
         mock_copy.assert_not_called()
         self.assertTrue(mock_booted_from_vmedia.called)
+        self.assertTrue(mock_unmount_config.called)
 
     def test_mounted_no_files(
             self, mock_execute, mock_mount, mock_copy,
-            mock_find_device, mock_check_vmedia, mock_booted_from_vmedia):
+            mock_find_device, mock_check_vmedia, mock_booted_from_vmedia,
+            mock_unmount_config):
 
         mock_booted_from_vmedia.return_value = True
         mock_execute.return_value = '/some/path', ''
@@ -1010,11 +1006,13 @@ class TestCopyConfigFromVmedia(testtools.TestCase):
         mock_copy.assert_not_called()
         mock_mount.assert_not_called()
         self.assertTrue(mock_booted_from_vmedia.called)
+        self.assertTrue(mock_unmount_config.called)
 
     @mock.patch.object(os, 'makedirs', autospec=True)
     def test_copy(
             self, mock_makedirs, mock_execute, mock_mount, mock_copy,
-            mock_find_device, mock_check_vmedia, mock_booted_from_vmedia):
+            mock_find_device, mock_check_vmedia, mock_booted_from_vmedia,
+            mock_unmount_config):
 
         mock_booted_from_vmedia.return_value = True
         mock_find_device.return_value = '/dev/something'
@@ -1053,12 +1051,14 @@ class TestCopyConfigFromVmedia(testtools.TestCase):
             mock.call(mock.ANY, '/etc/ironic-python-agent.d/ironic.conf'),
         ], any_order=True)
         self.assertTrue(mock_booted_from_vmedia.called)
+        self.assertTrue(mock_unmount_config.called)
 
     @mock.patch.object(os, 'makedirs', autospec=True)
     def test_copy_mounted(
             self, mock_makedirs, mock_execute, mock_mount,
             mock_copy, mock_find_device, mock_check_vmedia,
-            mock_booted_from_vmedia):
+            mock_booted_from_vmedia,
+            mock_unmount_config):
         mock_booted_from_vmedia.return_value = True
         mock_find_device.return_value = '/dev/something'
         path = tempfile.mkdtemp()
@@ -1094,10 +1094,11 @@ class TestCopyConfigFromVmedia(testtools.TestCase):
         ], any_order=True)
         mock_mount.assert_not_called()
         self.assertTrue(mock_booted_from_vmedia.called)
+        self.assertTrue(mock_unmount_config.called)
 
 
 @mock.patch.object(requests, 'get', autospec=True)
-class TestStreamingClient(ironic_agent_base.IronicAgentTest):
+class TestStreamingClient(base.IronicAgentTest):
 
     def test_ok(self, mock_get):
         client = utils.StreamingClient()
@@ -1126,7 +1127,7 @@ class TestStreamingClient(ironic_agent_base.IronicAgentTest):
         self.assertEqual(2, mock_get.call_count)
 
 
-class TestCheckVirtualMedia(ironic_agent_base.IronicAgentTest):
+class TestCheckVirtualMedia(base.IronicAgentTest):
 
     @mock.patch.object(utils, 'execute', autospec=True)
     def test_check_vmedia_device(self, mock_execute):
@@ -1193,7 +1194,7 @@ class TestCheckVirtualMedia(ironic_agent_base.IronicAgentTest):
                                         '/dev/sdh')
 
 
-class TestCheckEarlyLogging(ironic_agent_base.IronicAgentTest):
+class TestCheckEarlyLogging(base.IronicAgentTest):
 
     @mock.patch.object(utils, 'LOG', autospec=True)
     def test_early_logging_goes_to_logger(self, mock_log):
@@ -1214,3 +1215,205 @@ class TestCheckEarlyLogging(ironic_agent_base.IronicAgentTest):
         expected_calls = [mock.call('Early logging: %s', 'line 1.'),
                           mock.call('Early logging: %s', 'line 2 message')]
         info.assert_has_calls(expected_calls)
+
+
+class TestUnmountOfConfig(base.IronicAgentTest):
+
+    @mock.patch.object(utils, '_early_log', autospec=True)
+    @mock.patch.object(os.path, 'ismount', autospec=True)
+    @mock.patch.object(utils, 'execute', autospec=True)
+    @mock.patch.object(time, 'sleep', autospec=True)
+    def test__unmount_any_config_drives(self, mock_sleep, mock_exec,
+                                        mock_ismount, mock_log,):
+        mock_ismount.side_effect = iter([True, True, False])
+        utils._unmount_any_config_drives()
+        self.assertEqual(2, mock_sleep.call_count)
+        self.assertEqual(2, mock_log.call_count)
+        mock_exec.assert_has_calls([
+            mock.call('umount', '/mnt/config'),
+            mock.call('umount', '/mnt/config')])
+
+
+class BareMetalUtilsTestCase(base.IronicAgentTest):
+
+    def test_unlink(self):
+        with mock.patch.object(os, "unlink", autospec=True) as unlink_mock:
+            unlink_mock.return_value = None
+            utils.unlink_without_raise("/fake/path")
+            unlink_mock.assert_called_once_with("/fake/path")
+
+    def test_unlink_ENOENT(self):
+        with mock.patch.object(os, "unlink", autospec=True) as unlink_mock:
+            unlink_mock.side_effect = OSError(errno.ENOENT)
+            utils.unlink_without_raise("/fake/path")
+            unlink_mock.assert_called_once_with("/fake/path")
+
+
+class ExecuteTestCase(base.IronicAgentTest):
+    # Allow calls to utils.execute() and related functions
+    block_execute = False
+
+    @mock.patch.object(processutils, 'execute', autospec=True)
+    @mock.patch.object(os.environ, 'copy', return_value={}, autospec=True)
+    def test_execute_use_standard_locale_no_env_variables(self, env_mock,
+                                                          execute_mock):
+        utils.execute('foo', use_standard_locale=True)
+        execute_mock.assert_called_once_with('foo',
+                                             env_variables={'LC_ALL': 'C'})
+
+    @mock.patch.object(processutils, 'execute', autospec=True)
+    def test_execute_use_standard_locale_with_env_variables(self,
+                                                            execute_mock):
+        utils.execute('foo', use_standard_locale=True,
+                      env_variables={'foo': 'bar'})
+        execute_mock.assert_called_once_with('foo',
+                                             env_variables={'LC_ALL': 'C',
+                                                            'foo': 'bar'})
+
+    @mock.patch.object(processutils, 'execute', autospec=True)
+    def test_execute_not_use_standard_locale(self, execute_mock):
+        utils.execute('foo', use_standard_locale=False,
+                      env_variables={'foo': 'bar'})
+        execute_mock.assert_called_once_with('foo',
+                                             env_variables={'foo': 'bar'})
+
+    @mock.patch.object(utils, 'LOG', autospec=True)
+    def _test_execute_with_log_stdout(self, log_mock, log_stdout=None):
+        with mock.patch.object(
+                processutils, 'execute', autospec=True) as execute_mock:
+            execute_mock.return_value = ('stdout', 'stderr')
+            if log_stdout is not None:
+                utils.execute('foo', log_stdout=log_stdout)
+            else:
+                utils.execute('foo')
+            execute_mock.assert_called_once_with('foo')
+            name, args, kwargs = log_mock.debug.mock_calls[0]
+            if log_stdout is False:
+                self.assertEqual(1, log_mock.debug.call_count)
+                self.assertNotIn('stdout', args[0])
+            else:
+                self.assertEqual(2, log_mock.debug.call_count)
+                self.assertIn('stdout', args[0])
+
+    def test_execute_with_log_stdout_default(self):
+        self._test_execute_with_log_stdout()
+
+    def test_execute_with_log_stdout_true(self):
+        self._test_execute_with_log_stdout(log_stdout=True)
+
+    def test_execute_with_log_stdout_false(self):
+        self._test_execute_with_log_stdout(log_stdout=False)
+
+    @mock.patch.object(utils, 'LOG', autospec=True)
+    @mock.patch.object(processutils, 'execute', autospec=True)
+    def test_execute_command_not_found(self, execute_mock, log_mock):
+        execute_mock.side_effect = FileNotFoundError
+        self.assertRaises(FileNotFoundError, utils.execute, 'foo')
+        execute_mock.assert_called_once_with('foo')
+        name, args, kwargs = log_mock.debug.mock_calls[0]
+        self.assertEqual(1, log_mock.debug.call_count)
+        self.assertIn('not found', args[0])
+
+
+class MkfsTestCase(base.IronicAgentTest):
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_mkfs(self, execute_mock):
+        utils.mkfs('ext4', '/my/block/dev')
+        utils.mkfs('msdos', '/my/msdos/block/dev')
+        utils.mkfs('swap', '/my/swap/block/dev')
+
+        expected = [mock.call('mkfs', '-t', 'ext4', '-F', '/my/block/dev',
+                              use_standard_locale=True),
+                    mock.call('mkfs', '-t', 'msdos', '/my/msdos/block/dev',
+                              use_standard_locale=True),
+                    mock.call('mkswap', '/my/swap/block/dev',
+                              use_standard_locale=True)]
+        self.assertEqual(expected, execute_mock.call_args_list)
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_mkfs_with_label(self, execute_mock):
+        utils.mkfs('ext4', '/my/block/dev', 'ext4-vol')
+        utils.mkfs('msdos', '/my/msdos/block/dev', 'msdos-vol')
+        utils.mkfs('swap', '/my/swap/block/dev', 'swap-vol')
+
+        expected = [mock.call('mkfs', '-t', 'ext4', '-F', '-L', 'ext4-vol',
+                              '/my/block/dev',
+                              use_standard_locale=True),
+                    mock.call('mkfs', '-t', 'msdos', '-n', 'msdos-vol',
+                              '/my/msdos/block/dev',
+                              use_standard_locale=True),
+                    mock.call('mkswap', '-L', 'swap-vol',
+                              '/my/swap/block/dev',
+                              use_standard_locale=True)]
+        self.assertEqual(expected, execute_mock.call_args_list)
+
+    @mock.patch.object(utils, 'execute', autospec=True,
+                       side_effect=processutils.ProcessExecutionError(
+                           stderr=os.strerror(errno.ENOENT)))
+    def test_mkfs_with_unsupported_fs(self, execute_mock):
+        self.assertRaises(errors.FileSystemNotSupported,
+                          utils.mkfs, 'foo', '/my/block/dev')
+
+    @mock.patch.object(utils, 'execute', autospec=True,
+                       side_effect=processutils.ProcessExecutionError(
+                           stderr='fake'))
+    def test_mkfs_with_unexpected_error(self, execute_mock):
+        self.assertRaises(processutils.ProcessExecutionError, utils.mkfs,
+                          'ext4', '/my/block/dev', 'ext4-vol')
+
+
+@mock.patch.object(utils, 'execute', autospec=True)
+class GetRouteSourceTestCase(base.IronicAgentTest):
+
+    def test_get_route_source_ipv4(self, mock_execute):
+        mock_execute.return_value = ('XXX src 1.2.3.4 XXX\n    cache', None)
+
+        source = utils.get_route_source('XXX')
+        self.assertEqual('1.2.3.4', source)
+
+    def test_get_route_source_ipv6(self, mock_execute):
+        mock_execute.return_value = ('XXX src 1:2::3:4 metric XXX\n    cache',
+                                     None)
+
+        source = utils.get_route_source('XXX')
+        self.assertEqual('1:2::3:4', source)
+
+    def test_get_route_source_ipv6_linklocal(self, mock_execute):
+        mock_execute.return_value = (
+            'XXX src fe80::1234:1234:1234:1234 metric XXX\n    cache', None)
+
+        source = utils.get_route_source('XXX')
+        self.assertIsNone(source)
+
+    def test_get_route_source_ipv6_linklocal_allowed(self, mock_execute):
+        mock_execute.return_value = (
+            'XXX src fe80::1234:1234:1234:1234 metric XXX\n    cache', None)
+
+        source = utils.get_route_source('XXX', ignore_link_local=False)
+        self.assertEqual('fe80::1234:1234:1234:1234', source)
+
+    def test_get_route_source_indexerror(self, mock_execute):
+        mock_execute.return_value = ('XXX src \n    cache', None)
+
+        source = utils.get_route_source('XXX')
+        self.assertIsNone(source)
+
+
+class ParseDeviceTagsTestCase(base.IronicAgentTest):
+
+    def test_empty(self):
+        result = utils.parse_device_tags("\n\n")
+        self.assertEqual([], list(result))
+
+    def test_parse(self):
+        tags = """
+ PTUUID="00016a50" PTTYPE="dos" LABEL=""
+TYPE="vfat" PART_ENTRY_SCHEME="gpt" PART_ENTRY_NAME="EFI System Partition"
+        """
+        result = list(utils.parse_device_tags(tags))
+        self.assertEqual([
+            {'PTUUID': '00016a50', 'PTTYPE': 'dos', 'LABEL': ''},
+            {'TYPE': 'vfat', 'PART_ENTRY_SCHEME': 'gpt',
+             'PART_ENTRY_NAME': 'EFI System Partition'}
+        ], result)

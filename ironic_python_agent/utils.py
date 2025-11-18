@@ -19,21 +19,25 @@ import copy
 import errno
 import glob
 import io
+import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
+import warnings
 
-from ironic_lib import utils as ironic_utils
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import excutils
 from oslo_utils import units
-import pyudev
 import requests
 import tenacity
 
@@ -60,22 +64,8 @@ AGENT_PARAMS_CACHED = dict()
 
 
 LSBLK_COLUMNS = ['KNAME', 'MODEL', 'SIZE', 'ROTA',
-                 'TYPE', 'UUID', 'PARTUUID', 'SERIAL']
-
-
-COLLECT_LOGS_COMMANDS = {
-    'ps': ['ps', 'au'],
-    'df': ['df', '-a'],
-    'iptables': ['iptables', '-L'],
-    'ip_addr': ['ip', 'addr'],
-    'lshw': ['lshw', '-quiet', '-json'],
-    'lsblk': ['lsblk', '--all', '-o%s' % ','.join(LSBLK_COLUMNS)],
-    'lsblk-full': ['lsblk', '--all', '--bytes', '--output-all', '--pairs'],
-    'mdstat': ['cat', '/proc/mdstat'],
-    'mount': ['mount'],
-    'parted': ['parted', '-l'],
-    'multipath': ['multipath', '-ll'],
-}
+                 'TYPE', 'UUID', 'PARTUUID', 'SERIAL', 'WWN',
+                 'LOG-SEC', 'PHY-SEC', 'TRAN']
 
 
 DEVICE_EXTRACTOR = re.compile(r'^(?:(.*\d)p|(.*\D))(?:\d+)$')
@@ -84,12 +74,200 @@ DEVICE_EXTRACTOR = re.compile(r'^(?:(.*\d)p|(.*\D))(?:\d+)$')
 _EARLY_LOG_BUFFER = []
 
 
-def execute(*cmd, **kwargs):
-    """Convenience wrapper around ironic_lib's execute() method.
+def execute(*cmd, use_standard_locale=False, log_stdout=True, **kwargs):
+    """Convenience wrapper around oslo's execute() method.
 
-    Executes and logs results from a system command.
+    Executes and logs results from a system command. See docs for
+    oslo_concurrency.processutils.execute for usage.
+
+    :param cmd: positional arguments to pass to processutils.execute()
+    :param use_standard_locale: Defaults to False. If set to True,
+                                execute command with standard locale
+                                added to environment variables.
+    :param log_stdout: Defaults to True. If set to True, logs the output.
+    :param kwargs: keyword arguments to pass to processutils.execute()
+    :returns: (stdout, stderr) from process execution
+    :raises: UnknownArgumentError on receiving unknown arguments
+    :raises: ProcessExecutionError
+    :raises: OSError
     """
-    return ironic_utils.execute(*cmd, **kwargs)
+    if use_standard_locale:
+        env = kwargs.pop('env_variables', os.environ.copy())
+        env['LC_ALL'] = 'C'
+        kwargs['env_variables'] = env
+
+    if kwargs.pop('run_as_root', False):
+        warnings.warn("run_as_root is deprecated and has no effect",
+                      DeprecationWarning)
+
+    def _log(stdout, stderr):
+        if log_stdout:
+            try:
+                LOG.debug('Command stdout is: "%s"', stdout)
+            except UnicodeEncodeError:
+                LOG.debug('stdout contains invalid UTF-8 characters')
+                stdout = (stdout.encode('utf8', 'surrogateescape')
+                          .decode('utf8', 'ignore'))
+                LOG.debug('Command stdout is: "%s"', stdout)
+        try:
+            LOG.debug('Command stderr is: "%s"', stderr)
+        except UnicodeEncodeError:
+            LOG.debug('stderr contains invalid UTF-8 characters')
+            stderr = (stderr.encode('utf8', 'surrogateescape')
+                      .decode('utf8', 'ignore'))
+            LOG.debug('Command stderr is: "%s"', stderr)
+
+    try:
+        result = processutils.execute(*cmd, **kwargs)
+    except FileNotFoundError:
+        with excutils.save_and_reraise_exception():
+            LOG.debug('Command not found: "%s"', ' '.join(map(str, cmd)))
+    except processutils.ProcessExecutionError as exc:
+        with excutils.save_and_reraise_exception():
+            _log(exc.stdout, exc.stderr)
+    else:
+        _log(result[0], result[1])
+        return result
+
+
+def mkfs(fs, path, label=None):
+    """Format a file or block device
+
+    :param fs: Filesystem type (examples include 'swap', 'ext3', 'ext4'
+               'btrfs', etc.)
+    :param path: Path to file or block device to format
+    :param label: Volume label to use
+    """
+    if fs == 'swap':
+        args = ['mkswap']
+    else:
+        args = ['mkfs', '-t', fs]
+    # add -F to force no interactive execute on non-block device.
+    if fs in ('ext3', 'ext4'):
+        args.extend(['-F'])
+    if label:
+        if fs in ('msdos', 'vfat'):
+            label_opt = '-n'
+        else:
+            label_opt = '-L'
+        args.extend([label_opt, label])
+    args.append(path)
+    try:
+        execute(*args, use_standard_locale=True)
+    except processutils.ProcessExecutionError as e:
+        with excutils.save_and_reraise_exception() as ctx:
+            if os.strerror(errno.ENOENT) in e.stderr:
+                ctx.reraise = False
+                LOG.exception('Failed to make file system. '
+                              'File system %s is not supported.', fs)
+                raise errors.FileSystemNotSupported(fs=fs)
+            else:
+                LOG.exception('Failed to create a file system '
+                              'in %(path)s. Error: %(error)s',
+                              {'path': path, 'error': e})
+
+
+def try_execute(*cmd, **kwargs):
+    """The same as execute but returns None on error.
+
+    Executes and logs results from a system command. See docs for
+    oslo_concurrency.processutils.execute for usage.
+
+    Instead of raising an exception on failure, this method simply
+    returns None in case of failure.
+
+    :param cmd: positional arguments to pass to processutils.execute()
+    :param kwargs: keyword arguments to pass to processutils.execute()
+    :raises: UnknownArgumentError on receiving unknown arguments
+    :returns: tuple of (stdout, stderr) or None in some error cases
+    """
+    try:
+        return execute(*cmd, **kwargs)
+    except (processutils.ProcessExecutionError, OSError) as e:
+        LOG.debug('Command failed: %s', e)
+
+
+def parse_device_tags(output):
+    """Parse tags from the lsblk/blkid output.
+
+    Parses format KEY="VALUE" KEY2="VALUE2".
+
+    :return: a generator yielding dicts with information from each line.
+    """
+    for line in output.strip().split('\n'):
+        if line.strip():
+            try:
+                yield {key: value for key, value in
+                       (v.split('=', 1) for v in shlex.split(line))}
+            except ValueError as err:
+                raise ValueError(
+                    ("Malformed blkid/lsblk output line '%(line)s': %(err)s")
+                    % {'line': line, 'err': err})
+
+
+@contextlib.contextmanager
+def mounted(source, dest=None, opts=None, fs_type=None,
+            mount_attempts=1, umount_attempts=3):
+    """A context manager for a temporary mount.
+
+    :param source: A device to mount.
+    :param dest: Mount destination. If not specified, a temporary directory
+        will be created and removed afterwards. An existing destination is
+        not removed.
+    :param opts: Mount options (``-o`` argument).
+    :param fs_type: File system type (``-t`` argument).
+    :param mount_attempts: A number of attempts to mount the device.
+    :param umount_attempts: A number of attempts to unmount the device.
+    :returns: A generator yielding the destination.
+    """
+    params = []
+    if opts:
+        params.extend(['-o', ','.join(opts)])
+    if fs_type:
+        params.extend(['-t', fs_type])
+
+    if dest is None:
+        dest = tempfile.mkdtemp()
+        clean_up = True
+    else:
+        clean_up = False
+
+    mounted = False
+    try:
+        execute("mount", source, dest, *params,
+                attempts=mount_attempts, delay_on_retry=True)
+        mounted = True
+        yield dest
+    finally:
+        if mounted:
+            try:
+                execute("umount", dest, attempts=umount_attempts,
+                        delay_on_retry=True)
+            except (EnvironmentError,
+                    processutils.ProcessExecutionError) as exc:
+                LOG.warning(
+                    'Unable to unmount temporary location %(dest)s: %(err)s',
+                    {'dest': dest, 'err': exc})
+                # NOTE(dtantsur): don't try to remove a still mounted location
+                clean_up = False
+
+        if clean_up:
+            try:
+                shutil.rmtree(dest)
+            except EnvironmentError as exc:
+                LOG.warning(
+                    'Unable to remove temporary location %(dest)s: %(err)s',
+                    {'dest': dest, 'err': exc})
+
+
+def unlink_without_raise(path):
+    try:
+        os.unlink(path)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return
+        else:
+            LOG.warning("Failed to unlink %s, error: %s", path, e)
 
 
 def _read_params_from_file(filepath):
@@ -139,7 +317,7 @@ def _find_vmedia_device_by_labels(labels):
         _early_log('Was unable to execute the lsblk command. %s', e)
         return
 
-    for device in ironic_utils.parse_device_tags(lsblk_output):
+    for device in parse_device_tags(lsblk_output):
         for label in labels:
             if label.upper() == device['LABEL'].upper():
                 candidates.append(device['KNAME'])
@@ -182,7 +360,7 @@ def _get_vmedia_params():
             # If the device is not valid, return an empty dictionary.
             return {}
 
-    with ironic_utils.mounted(vmedia_device_file) as vmedia_mount_point:
+    with mounted(vmedia_device_file) as vmedia_mount_point:
         parameters_file_path = os.path.join(vmedia_mount_point,
                                             parameters_file)
         params = _read_params_from_file(parameters_file_path)
@@ -240,7 +418,7 @@ def _find_mount_point(device):
 def _check_vmedia_device(vmedia_device_file):
     """Check if a virtual media device appears valid.
 
-    Explicitly ignores partitions, actual disks, and other itmes that
+    Explicitly ignores partitions, actual disks, and other items that
     seem unlikely to be virtual media based items being provided
     into the running operating system via a BMC.
 
@@ -257,9 +435,9 @@ def _check_vmedia_device(vmedia_device_file):
                    'virtual media identification. %s', e)
         return False
     try:
-        for device in ironic_utils.parse_device_tags(output):
+        for device in parse_device_tags(output):
             if device['TYPE'] == 'part':
-                _early_log('Excluding device %s from virtual media'
+                _early_log('Excluding device %s from virtual media '
                            'consideration as it is a partition.',
                            device['KNAME'])
                 return False
@@ -327,18 +505,27 @@ def copy_config_from_vmedia():
         ['config-2', 'vmedia_boot_iso'])
     if not vmedia_device_file:
         _early_log('No virtual media device detected')
+        _unmount_any_config_drives()
         return
     if not _booted_from_vmedia():
         _early_log('Cannot use configuration from virtual media as the '
                    'agent was not booted from virtual media.')
+        _unmount_any_config_drives()
         return
     # Determine the device
-    mounted = _find_mount_point(vmedia_device_file)
-    if mounted:
-        _copy_config_from(mounted)
+    mount_point = _find_mount_point(vmedia_device_file)
+    if mount_point:
+        # In this case a utility like a configuration drive tool
+        # has *already* mounted the device we believe to be the
+        # configuration drive.
+        _copy_config_from(mount_point)
     else:
-        with ironic_utils.mounted(vmedia_device_file) as vmedia_mount_point:
+        with mounted(vmedia_device_file) as vmedia_mount_point:
+            # In this case, we use a temporary folder and extract the contents
+            # for our configuration.
             _copy_config_from(vmedia_mount_point)
+    # As a last act, just make sure there is nothing else mounted.
+    _unmount_any_config_drives()
 
 
 def _get_cached_params():
@@ -540,40 +727,12 @@ def gzip_and_b64encode(io_dict=None, file_list=None):
         return _encode_as_text(fp.getvalue())
 
 
-def _collect_udev(io_dict):
-    """Collect device properties from udev."""
+def try_collect_command_output(io_dict, file_name, command):
+    LOG.debug('Collecting command output: %s', command)
     try:
-        out, _e = ironic_utils.execute('lsblk', '-no', 'KNAME')
-    except processutils.ProcessExecutionError as exc:
-        LOG.warning('Could not list block devices: %s', exc)
-        return
-
-    context = pyudev.Context()
-
-    for kname in out.splitlines():
-        kname = kname.strip()
-        if not kname:
-            continue
-
-        name = os.path.join('/dev', kname)
-
-        try:
-            udev = pyudev.Devices.from_device_file(context, name)
-        except Exception as e:
-            LOG.warning("Device %(dev)s is inaccessible, skipping... "
-                        "Error: %(error)s", {'dev': name, 'error': e})
-            continue
-
-        try:
-            props = dict(udev.properties)
-        except AttributeError:  # pyudev < 0.20
-            props = dict(udev)
-
-        fp = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
-        json.dump(props, fp)
-        buf = fp.detach()
-        buf.seek(0)
-        io_dict[f'udev/{kname}'] = buf
+        io_dict[file_name] = get_command_output(command)
+    except errors.CommandExecutionError:
+        LOG.debug('Collecting logs from command %s has failed', command)
 
 
 def collect_system_logs(journald_max_lines=None):
@@ -589,12 +748,6 @@ def collect_system_logs(journald_max_lines=None):
     """
     LOG.info('Collecting system logs and debugging information')
 
-    def try_get_command_output(io_dict, file_name, command):
-        try:
-            io_dict[file_name] = get_command_output(command)
-        except errors.CommandExecutionError:
-            LOG.debug('Collecting logs from command %s has failed', command)
-
     io_dict = {}
     file_list = []
     log_locations = [CONF.log_file, CONF.log_dir]
@@ -604,20 +757,19 @@ def collect_system_logs(journald_max_lines=None):
             if log_loc and os.path.exists(log_loc):
                 file_list.append(log_loc)
     else:
-        try_get_command_output(io_dict, 'dmesg', ['dmesg'])
         file_list.append('/var/log')
         for log_loc in log_locations:
             if (log_loc and os.path.exists(log_loc)
                     and not log_loc.startswith('/var/log')):
                 file_list.append(log_loc)
 
-    for name, cmd in COLLECT_LOGS_COMMANDS.items():
-        try_get_command_output(io_dict, name, cmd)
-
+    # Avoid circular imports
+    from ironic_python_agent import hardware
     try:
-        _collect_udev(io_dict)
-    except Exception:
-        LOG.exception('Unexpected error when collecting udev properties')
+        hardware.dispatch_to_all_managers('collect_system_logs',
+                                          io_dict, file_list)
+    except errors.HardwareManagerMethodNotFound:
+        LOG.warning('All hardware managers failed to collect logs')
 
     return gzip_and_b64encode(io_dict=io_dict, file_list=file_list)
 
@@ -673,7 +825,7 @@ def _parse_capabilities_str(cap_str):
     """Extract capabilities from string.
 
     :param cap_str: string meant to meet key1:value1,key2:value2 format
-    :return: a dictionnary
+    :return: a dictionary
     """
     LOG.debug("Parsing capability string %s", cap_str)
     capabilities = {}
@@ -740,7 +892,7 @@ def get_node_boot_mode(node):
     'instance_info/capabilities' of node. Otherwise it directly look for boot
     mode hints into
 
-    :param node: dictionnary.
+    :param node: dictionary.
     :returns: 'bios' or 'uefi'
     """
     instance_info = node.get('instance_info', {})
@@ -748,7 +900,7 @@ def get_node_boot_mode(node):
     node_caps = parse_capabilities(node.get('properties', {}))
 
     if _is_secure_boot(instance_info_caps, node_caps):
-        LOG.debug('Deploy boot mode is implicitely uefi for because secure '
+        LOG.debug('Deploy boot mode is implicitly uefi because secure '
                   'boot is activated.')
         return 'uefi'
 
@@ -821,7 +973,7 @@ def determine_time_method():
 
     :returns: "ntpdate" if ntpdate has been found, "chrony" if chrony
               was located, and None if neither are located. If both tools
-              are present, "chrony" will supercede "ntpdate".
+              are present, "chrony" will supersede "ntpdate".
     """
     try:
         execute('chronyd', '-h')
@@ -968,3 +1120,81 @@ def rescan_device(device):
     except processutils.ProcessExecutionError as e:
         LOG.warning('Something went wrong when waiting for udev '
                     'to settle. Error: %s', e)
+
+
+def _lshw_matches(item, by_id, fields):
+    lshw_id = item.get('id', '')
+    if isinstance(by_id, re.Pattern):
+        if by_id.match(lshw_id) is None:
+            return False
+    elif by_id is not None and by_id != lshw_id:
+        return False
+
+    for key, value in fields.items():
+        if item.get(key) != value:
+            return False
+
+    return True
+
+
+def find_in_lshw(lshw, by_id=None, by_class=None, recursive=False, **fields):
+    """Yield all suitable records from lshw."""
+    # Cannot really pass class=... in Python
+    if by_class is not None:
+        fields['class'] = by_class
+    for child in lshw.get('children', ()):
+        if _lshw_matches(child, by_id, fields):
+            yield child
+        if recursive:
+            yield from find_in_lshw(child, by_id, recursive=True, **fields)
+
+
+def _unmount_any_config_drives():
+    """Umount anything mounted to /mnt/config
+
+    As part of the configuration drive model, utilities like cloud-init
+    and glean leverage a folder at /mnt/config to convey configuration
+    to a booting OS.
+
+    The possibility exists that one of the utilities mounted one or multiple
+    such folders, even if the configuration was not used, and this can
+    result in locked devices which can prevent rebuild operations from
+    completing successfully as long as the folder is mounted, it is
+    a "locked" device to the operating system.
+    """
+    while os.path.ismount('/mnt/config'):
+        _early_log('Issuing an umount command for /mnt/config...')
+        execute('umount', '/mnt/config')
+        time.sleep(1)
+
+
+def is_char_device(path):
+    '''Check if the specified path is a character device.'''
+    try:
+        return stat.S_ISCHR(os.stat(path).st_mode)
+    except OSError:
+        # Likely because of insufficient permission,
+        # race conditions or I/O related errors.
+        return False
+
+
+def get_route_source(dest, ignore_link_local=True):
+    """Get the IP address to send packages to destination."""
+    try:
+        out, _err = execute('ip', 'route', 'get', dest)
+    except (EnvironmentError, processutils.ProcessExecutionError) as e:
+        LOG.warning('Cannot get route to host %(dest)s: %(err)s',
+                    {'dest': dest, 'err': e})
+        return
+
+    try:
+        source = out.strip().split('\n')[0].split('src')[1].split()[0]
+        if (ipaddress.ip_address(source).is_link_local
+                and ignore_link_local):
+            LOG.debug('Ignoring link-local source to %(dest)s: %(rec)s',
+                      {'dest': dest, 'rec': out})
+            return
+        return source
+    except (IndexError, ValueError):
+        LOG.debug('No route to host %(dest)s, route record: %(rec)s',
+                  {'dest': dest, 'rec': out})
