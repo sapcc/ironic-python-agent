@@ -100,6 +100,21 @@ class AgentIsBusy(CommandExecutionError):
         super().__init__('executing command %s' % command_name)
 
 
+class AgentCommandConflict(CommandExecutionError):
+    """A stable command identity was reused with a different body.
+
+    The message carries only the command identity. Command parameters may
+    contain secrets and never appear in an error.
+    """
+
+    message = 'Agent command conflict'
+    status_code = 409
+
+    def __init__(self, command_id):
+        super().__init__('command %s was already admitted with a different '
+                         'name or body' % command_id)
+
+
 class IronicAPIError(RESTError):
     """Error raised when a call to the agent API fails."""
 

@@ -13,8 +13,11 @@
 # limitations under the License.
 
 import collections
+import copy
 import functools
+import hashlib
 import inspect
+import json
 import threading
 
 from oslo_log import log
@@ -45,16 +48,23 @@ class BaseCommandResult(encoding.SerializableComparable):
     serializable_fields = ('id', 'command_name',
                            'command_status', 'command_error', 'command_result')
 
-    def __init__(self, command_name, command_params):
+    def __init__(self, command_name, command_params, command_id=None,
+                 command_fingerprint=None):
         """Construct an instance of BaseCommandResult.
 
         :param command_name: name of command executed
         :param command_params: parameters passed to command
+        :param command_id: stable command identity owned by the caller. A
+            generated identity is used when the caller does not have one.
+        :param command_fingerprint: digest of the frozen name and parameters,
+            used to detect a changed body for a stable identity. It is never
+            serialized because it is derived from possibly secret values.
         """
 
-        self.id = uuidutils.generate_uuid()
+        self.id = command_id or uuidutils.generate_uuid()
         self.command_name = command_name
         self.command_params = command_params
+        self.command_fingerprint = command_fingerprint
         self.command_status = AgentCommandStatus.RUNNING
         self.command_error = None
         self.command_result = None
@@ -94,7 +104,8 @@ class BaseCommandResult(encoding.SerializableComparable):
 class SyncCommandResult(BaseCommandResult):
     """A result from a command that executes synchronously."""
 
-    def __init__(self, command_name, command_params, success, result_or_error):
+    def __init__(self, command_name, command_params, success, result_or_error,
+                 command_id=None, command_fingerprint=None):
         """Construct an instance of SyncCommandResult.
 
         :param command_name: name of command executed
@@ -103,8 +114,9 @@ class SyncCommandResult(BaseCommandResult):
         :param result_or_error: Contains the result (or error) from the command
         """
 
-        super(SyncCommandResult, self).__init__(command_name,
-                                                command_params)
+        super(SyncCommandResult, self).__init__(
+            command_name, command_params, command_id=command_id,
+            command_fingerprint=command_fingerprint)
         if isinstance(result_or_error, (bytes, str)):
             result_key = 'result' if success else 'error'
             result_or_error = {result_key: result_or_error}
@@ -121,7 +133,7 @@ class AsyncCommandResult(BaseCommandResult):
     """A command that executes asynchronously in the background."""
 
     def __init__(self, command_name, command_params, execute_method,
-                 agent=None):
+                 agent=None, command_id=None, command_fingerprint=None):
         """Construct an instance of AsyncCommandResult.
 
         :param command_name: name of command to execute
@@ -129,7 +141,9 @@ class AsyncCommandResult(BaseCommandResult):
         :param execute_method: a callable to be executed asynchronously
         :param agent: Optional: an instance of IronicPythonAgent
         """
-        super(AsyncCommandResult, self).__init__(command_name, command_params)
+        super(AsyncCommandResult, self).__init__(
+            command_name, command_params, command_id=command_id,
+            command_fingerprint=command_fingerprint)
         self.agent = agent
         self.execute_method = execute_method
         self.command_state_lock = threading.Lock()
@@ -227,9 +241,15 @@ class BaseAgentExtension(object):
 
 
 class ExecuteCommandMixin(object):
+
     def __init__(self):
+        # command_lock serializes command execution. command_state_lock
+        # serializes the history so that a reporter snapshot never needs the
+        # execution lock.
         self.command_lock = threading.Lock()
+        self.command_state_lock = threading.Lock()
         self.command_results = collections.OrderedDict()
+        self._admission = threading.local()
         self.ext_mgr = None
 
     def get_extension(self, extension_name):
@@ -247,42 +267,114 @@ class ExecuteCommandMixin(object):
 
         return (command_parts[0], command_parts[1])
 
+    def _find_command_result(self, command_id):
+        with self.command_state_lock:
+            return self.command_results.get(command_id)
+
+    def register_command_result(self, result):
+        """Record an admitted command in the process-lifetime history.
+
+        The caller must have admitted the identity already. An asynchronous
+        result is registered before its execution thread starts.
+        """
+        with self.command_state_lock:
+            self.command_results[result.id] = result
+
     def execute_command(self, command_name, **kwargs):
         """Execute an agent command."""
         with self.command_lock:
-            LOG.debug('Executing command: %(name)s with args: %(args)s',
-                      {'name': command_name,
-                       'args': utils.remove_large_keys(kwargs)})
-            extension_part, command_part = self.split_command(command_name)
+            return self._execute_command(command_name, **kwargs)
 
-            if len(self.command_results) > 0:
-                last_command = list(self.command_results.values())[-1]
-                if not last_command.is_done():
-                    LOG.error('Tried to execute %(command)s, agent is still '
-                              'executing %(last)s', {'command': command_name,
-                                                     'last': last_command})
-                    raise errors.AgentIsBusy(last_command.command_name)
+    def admit_command(self, command_id, command_name, **kwargs):
+        """Execute one command under a caller-owned stable identity.
 
+        In agent-poll mode the conductor owns the command identity. The
+        identity is bound to the result and inserted into the history before
+        an asynchronous command starts. A redelivery of the same identity and
+        body returns the recorded result and does not execute a second time.
+        A changed name or body for the same identity is rejected.
+        """
+        # Detach nested parameters as soon as the identity is accepted.
+        # The fingerprint and the executed body must both describe the
+        # values the caller submitted, not a later mutation of the same
+        # objects. deepcopy keeps the accepted parameter types unchanged.
+        command_params = copy.deepcopy(kwargs)
+        fingerprint = _command_fingerprint(command_name, command_params)
+        with self.command_lock:
+            existing = self._find_command_result(command_id)
+            if existing is not None:
+                if existing.command_fingerprint != fingerprint:
+                    raise errors.AgentCommandConflict(command_id)
+                return existing
+
+            self._admission.command_id = command_id
+            self._admission.command_fingerprint = fingerprint
             try:
-                ext = self.get_extension(extension_part)
-                result = ext.execute(command_part, **kwargs)
-            except KeyError:
-                # Extension Not found
-                LOG.exception('Extension %s not found', extension_part)
-                raise errors.RequestedObjectNotFoundError('Extension',
-                                                          extension_part)
-            except errors.InvalidContentError as e:
-                # Any command may raise a InvalidContentError which will be
-                # returned to the caller directly.
-                LOG.exception('Invalid content error: %s', e)
-                raise e
-            except Exception as e:
-                # Other errors are considered command execution errors, and are
-                # recorded as a failed SyncCommandResult with an error message
-                LOG.exception('Command execution error: %s', e)
-                result = SyncCommandResult(command_name, kwargs, False, e)
-            self.command_results[result.id] = result
-            return result
+                return self._execute_command(command_name, **command_params)
+            finally:
+                self._admission.command_id = None
+                self._admission.command_fingerprint = None
+
+    def _execute_command(self, command_name, **kwargs):
+        """Execute a command while the caller holds command_lock."""
+        LOG.debug('Executing command: %(name)s with args: %(args)s',
+                  {'name': command_name,
+                   'args': utils.remove_large_keys(kwargs)})
+        extension_part, command_part = self.split_command(command_name)
+
+        if len(self.command_results) > 0:
+            last_command = list(self.command_results.values())[-1]
+            if not last_command.is_done():
+                LOG.error('Tried to execute %(command)s, agent is still '
+                          'executing %(last)s', {'command': command_name,
+                                                 'last': last_command})
+                raise errors.AgentIsBusy(last_command.command_name)
+
+        try:
+            ext = self.get_extension(extension_part)
+            result = ext.execute(command_part, **kwargs)
+        except KeyError:
+            # Extension Not found
+            LOG.exception('Extension %s not found', extension_part)
+            raise errors.RequestedObjectNotFoundError('Extension',
+                                                      extension_part)
+        except errors.InvalidContentError as e:
+            # Any command may raise a InvalidContentError which will be
+            # returned to the caller directly.
+            LOG.exception('Invalid content error: %s', e)
+            raise e
+        except Exception as e:
+            # Other errors are considered command execution errors, and are
+            # recorded as a failed SyncCommandResult with an error message
+            LOG.exception('Command execution error: %s', e)
+            result = SyncCommandResult(command_name, kwargs, False, e,
+                                       **_pending_admission(self))
+        self.register_command_result(result)
+        return result
+
+
+def _command_fingerprint(command_name, command_params):
+    """Digest the frozen command name and parameters.
+
+    The digest must not depend on dict ordering, because the same frozen
+    body arrives in whatever order the transport produced. The digest is
+    never logged, because parameters may carry secrets.
+    """
+    payload = json.dumps([command_name, command_params], sort_keys=True,
+                         separators=(',', ':'), default=repr)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _pending_admission(mixin):
+    admission = getattr(mixin, '_admission', None)
+    if admission is None:
+        return {}
+    command_id = getattr(admission, 'command_id', None)
+    if command_id is None:
+        return {}
+    return {'command_id': command_id,
+            'command_fingerprint': getattr(
+                admission, 'command_fingerprint', None)}
 
 
 def async_command(command_name, validator=None):
@@ -310,7 +402,15 @@ def async_command(command_name, validator=None):
             ret = AsyncCommandResult(command_name,
                                      command_params,
                                      bound_func,
-                                     agent=self.agent).start()
+                                     agent=self.agent,
+                                     **_pending_admission(self.agent))
+            # The stable identity must be durable in the history before the
+            # execution thread starts, otherwise a redelivery can start the
+            # same effect twice.
+            register = getattr(self.agent, 'register_command_result', None)
+            if register is not None:
+                register(ret)
+            ret.start()
             LOG.info('Asynchronous command %(name)s started execution',
                      {'name': command_name})
             return ret
@@ -342,7 +442,8 @@ def sync_command(command_name, validator=None):
             return SyncCommandResult(command_name,
                                      command_params,
                                      True,
-                                     result)
+                                     result,
+                                     **_pending_admission(self.agent))
 
         return wrapper
     return sync_decorator
