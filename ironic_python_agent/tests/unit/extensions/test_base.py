@@ -86,6 +86,30 @@ class AdmissionProbeExtension(base.BaseAgentExtension):
         return {'value': body['value'], 'items': list(body['items'])}
 
 
+class NestedAsyncExtension(base.BaseAgentExtension):
+    """Extension exercising an async command inside another command.
+
+    The deploy flow does exactly this: GenericHardwareManager.write_image
+    starts the standby ``prepare_image`` async command and waits for it
+    inside the ``execute_deploy_step`` command. The nested command must
+    stay out of the conductor-visible command history, because the
+    conductor decides whether a deploy step is done by inspecting the
+    LAST command only.
+    """
+
+    @base.async_command('outer_deploy_step')
+    def outer_deploy_step(self, param=None):
+        nested = self.inner_work()
+        nested.wait()
+        return {'deploy_step': {'step': 'write_image', 'interface': 'deploy',
+                                'priority': 80},
+                'deploy_result': 'ok'}
+
+    @base.async_command('inner_work')
+    def inner_work(self, param=None):
+        return {'result': 'ok'}
+
+
 class FakeAgent(base.ExecuteCommandMixin):
     def __init__(self):
         super(FakeAgent, self).__init__()
@@ -402,6 +426,40 @@ class TestCommandAdmission(test_base.IronicAgentTest):
             errors.AgentCommandConflict, self.agent.admit_command,
             'async-id', 'probe.admission_async_freeze', body=body)
         self.assertEqual(1, self.probe.calls)
+
+    def test_nested_async_stays_out_of_the_direct_history(self):
+        self.agent.ext_mgr = extension.ExtensionManager.make_test_instance(
+            [extension.Extension('nested', None, NestedAsyncExtension,
+                                 NestedAsyncExtension(agent=self.agent))])
+
+        outer = self.agent.execute_command('nested.outer_deploy_step',
+                                           param='v1')
+
+        outer.join(timeout=5)
+
+        self.assertEqual(base.AgentCommandStatus.SUCCEEDED,
+                         outer.command_status)
+        self.assertEqual(['outer_deploy_step'],
+                         [r.command_name
+                          for r in self.agent.command_results.values()])
+
+    def test_nested_async_stays_out_of_the_admitted_history(self):
+        # The same holds while running under a conductor-owned identity:
+        # the admitted command is the one the conductor correlates to,
+        # a nested command must not appear after it.
+        self.agent.ext_mgr = extension.ExtensionManager.make_test_instance(
+            [extension.Extension('nested', None, NestedAsyncExtension,
+                                 NestedAsyncExtension(agent=self.agent))])
+
+        outer = self.agent.admit_command(
+            'admitted-outer', 'nested.outer_deploy_step', param='v1')
+
+        outer.join(timeout=5)
+
+        self.assertEqual(base.AgentCommandStatus.SUCCEEDED,
+                         outer.command_status)
+        self.assertEqual(['admitted-outer'],
+                         list(self.agent.command_results))
 
 
 class TestExtensionDecorators(test_base.IronicAgentTest):

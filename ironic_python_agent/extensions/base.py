@@ -399,17 +399,23 @@ def async_command(command_name, validator=None):
             # know about the mode
             bound_func = functools.partial(func, self)
 
+            admission = _pending_admission(self.agent)
             ret = AsyncCommandResult(command_name,
                                      command_params,
                                      bound_func,
                                      agent=self.agent,
-                                     **_pending_admission(self.agent))
-            # The stable identity must be durable in the history before the
-            # execution thread starts, otherwise a redelivery can start the
-            # same effect twice.
-            register = getattr(self.agent, 'register_command_result', None)
-            if register is not None:
-                register(ret)
+                                     **admission)
+            # Bind an admitted identity into the history before the
+            # execution thread starts: a redelivery must not start the
+            # same effect twice. Commands without a caller-owned identity
+            # are NOT bound here. Direct-http mode records the top-level
+            # command when the API call returns, and a command started
+            # from inside another command's thread (e.g. prepare_image
+            # inside write_image) must stay out of the conductor-visible
+            # history, otherwise the conductor's last-command correlation
+            # can never match the deploy step again.
+            if admission:
+                self.agent.register_command_result(ret)
             ret.start()
             LOG.info('Asynchronous command %(name)s started execution',
                      {'name': command_name})
